@@ -1,0 +1,7 @@
+fastapi[standard]
+
+transformers
+torch
+accelerate
+
+huggingface_hub[hf_xet]
