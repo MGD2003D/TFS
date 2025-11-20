@@ -1,6 +1,8 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from .base import BaseLLMClient
+from typing import List, Dict
+from app_state import chat_histories, system_prompt
 
 class QwenClient(BaseLLMClient):
 
@@ -10,7 +12,8 @@ class QwenClient(BaseLLMClient):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
         self.tokenizer = None
-    
+
+
     async def initialize(self):
 
         print(f"Загружаю модель {self.model_name}")
@@ -28,13 +31,42 @@ class QwenClient(BaseLLMClient):
             vram = torch.cuda.memory_allocated() / 1024**3
             print(f"VRAM использовано: {vram:.2f} GB")
     
+
     async def simple_query(self, prompt: str) -> str:
 
         messages = [
-            {"role": "system", "content": "Ты полезный ассистент."}, #TODO: Системный промпт тоже можно вынести в app_state пока что
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ]
         
+        return await self._generate(messages)
+    
+
+    async def chat_query(self, messages: List[Dict[str, str]]) -> str:
+        
+        full_messages = [
+            {"role": "system", "content": system_prompt}
+        ] + messages
+
+        print(f"В generate ушло:\n{full_messages}")
+
+        return await self._generate(full_messages)
+
+
+    async def cleanup(self):
+
+        if self.model is not None:
+            del self.model
+            del self.tokenizer
+            
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            
+            print("Модель выгружена из памяти")
+
+
+    async def _generate(self, messages: List[Dict[str, str]]) -> str:
+
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -61,13 +93,3 @@ class QwenClient(BaseLLMClient):
         
         return response
     
-    async def cleanup(self):
-
-        if self.model is not None:
-            del self.model
-            del self.tokenizer
-            
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            
-            print("Модель выгружена из памяти")
