@@ -5,3 +5,7 @@ torch
 accelerate
 
 huggingface_hub[hf_xet]
+
+qdrant-client
+sentence-transformers
+pypdf
