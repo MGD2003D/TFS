@@ -4,6 +4,7 @@ from collections import defaultdict
 llm_client = None
 vector_store = None
 document_indexer = None
+minio_storage = None
 
 system_prompt = """Ты виртуальный ассистент туристического агентства. Твоя задача - помогать клиентам с выбором туров и отвечать на вопросы о путешествиях.
 
@@ -26,4 +27,4 @@ def get_user_messages(user_id: int) -> List[Dict[str, str]]:
     return chat_histories[user_id]
 
 def delete_user_history(user_id: int) -> None:
-    chat_histories.pop(user_id)
+    chat_histories.pop(user_id, None)

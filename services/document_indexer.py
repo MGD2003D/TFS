@@ -39,16 +39,21 @@ class DocumentIndexer:
 
         return [c for c in chunks if c]
 
-    async def process_pdf(self, pdf_path: str) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_pdf(self, pdf_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF файл не найден: {pdf_path}")
 
         text = self.extract_text_from_pdf(pdf_path)
         chunks = self.chunk_text(text)
 
+        if document_id is None:
+            import hashlib
+            document_id = hashlib.sha256(os.path.basename(pdf_path).encode()).hexdigest()[:16]
+
         metadata = []
         for idx, chunk in enumerate(chunks):
             metadata.append({
+                "document_id": document_id,
                 "source": os.path.basename(pdf_path),
                 "chunk_id": idx,
                 "total_chunks": len(chunks)
@@ -57,12 +62,13 @@ class DocumentIndexer:
         print(f"Извлечено {len(chunks)} чанков из {pdf_path}")
         return chunks, metadata
 
-    async def process_multiple_pdfs(self, pdf_paths: List[str]) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_multiple_pdfs(self, pdf_paths: List[str], document_ids: List[str] = None) -> tuple[List[str], List[Dict[str, Any]]]:
         all_chunks = []
         all_metadata = []
 
-        for pdf_path in pdf_paths:
-            chunks, metadata = await self.process_pdf(pdf_path)
+        for idx, pdf_path in enumerate(pdf_paths):
+            document_id = document_ids[idx] if document_ids and idx < len(document_ids) else None
+            chunks, metadata = await self.process_pdf(pdf_path, document_id=document_id)
             all_chunks.extend(chunks)
             all_metadata.extend(metadata)
 

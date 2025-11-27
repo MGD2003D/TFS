@@ -115,6 +115,43 @@ class QdrantVectorStore(BaseVectorStore):
         return results
 
 
+    async def delete_by_document_id(self, document_id: str) -> int:
+        result = self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=document_id)
+                        )
+                    ]
+                )
+            )
+        )
+        print(f"Удалены чанки документа {document_id} из Qdrant")
+        return result
+
+    async def get_documents_list(self) -> List[Dict[str, Any]]:
+        scroll_result = self.client.scroll(
+            collection_name=self.collection_name,
+            limit=10000,
+            with_payload=True,
+            with_vectors=False
+        )
+
+        documents = {}
+        for point in scroll_result[0]:
+            doc_id = point.payload.get("document_id")
+            if doc_id and doc_id not in documents:
+                documents[doc_id] = {
+                    "document_id": doc_id,
+                    "source": point.payload.get("source", "unknown"),
+                    "total_chunks": point.payload.get("total_chunks", 0)
+                }
+
+        return list(documents.values())
+
     async def delete_collection(self, collection_name: str = None) -> None:
         coll_name = collection_name or self.collection_name
         self.client.delete_collection(collection_name=coll_name)

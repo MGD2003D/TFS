@@ -2,3 +2,4 @@
 __pycache__/
 qdrant_storage/
 *.pdf
+**minio_storage
