@@ -1,11 +1,15 @@
 fastapi[standard]
 python-dotenv
+aiohttp
 
-transformers
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
-accelerate
+torchvision
+torchaudio
 
-huggingface_hub[hf_xet]
+# transformers
+# accelerate
+# huggingface_hub[hf_xet]
 
 qdrant-client
 sentence-transformers

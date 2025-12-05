@@ -28,11 +28,11 @@ async def sync_minio_to_qdrant():
     await minio_storage.initialize()
 
     vector_store = QdrantVectorStore(
-        embedding_model="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+        embedding_model="intfloat/multilingual-e5-base"
     )
     await vector_store.initialize()
 
-    document_indexer = DocumentIndexer(chunk_size=800, chunk_overlap=100)
+    document_indexer = DocumentIndexer(chunk_size=1000, chunk_overlap=200)
 
     print("Сервисы инициализированы")
 

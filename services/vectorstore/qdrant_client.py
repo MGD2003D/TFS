@@ -43,7 +43,9 @@ class QdrantVectorStore(BaseVectorStore):
                 os.environ['HTTPS_PROXY'] = old_https_proxy
 
         print(f"Загружаю embedding модель {self.embedding_model_name}")
+        print("Это может занять несколько минут при первом запуске (скачивание ~500MB)...")
         self.embedding_model = SentenceTransformer(self.embedding_model_name)
+        print(f"Модель {self.embedding_model_name} успешно загружена")
 
         vector_size = self.embedding_model.get_sentence_embedding_dimension()
 
@@ -71,7 +73,8 @@ class QdrantVectorStore(BaseVectorStore):
             )
             print(f"Создана коллекция {self.collection_name}")
 
-        embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
+        prefixed_texts = [f"passage: {text}" for text in texts] if self._use_prefixes() else texts
+        embeddings = self.embedding_model.encode(prefixed_texts, show_progress_bar=True, normalize_embeddings=True)
 
         points = []
         for idx, (text, embedding) in enumerate(zip(texts, embeddings)):
@@ -91,12 +94,12 @@ class QdrantVectorStore(BaseVectorStore):
             points=points
         )
 
-        print(f"Добавлено {len(points)} документов в {self.collection_name}")
+        print(f"Добавлено {len(points)} чанков в {self.collection_name}")
 
 
     async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-
-        query_vector = self.embedding_model.encode([query])[0]
+        prefixed_query = f"query: {query}" if self._use_prefixes() else query
+        query_vector = self.embedding_model.encode([prefixed_query], normalize_embeddings=True)[0]
 
         search_result = self.client.query_points(
             collection_name=self.collection_name,
@@ -156,6 +159,11 @@ class QdrantVectorStore(BaseVectorStore):
         coll_name = collection_name or self.collection_name
         self.client.delete_collection(collection_name=coll_name)
         print(f"Коллекция {coll_name} удалена")
+
+    def _use_prefixes(self) -> bool:
+        """Проверяет, требуется ли использовать префиксы query:/passage: для модели"""
+        e5_models = ["e5-small", "e5-base", "e5-large", "multilingual-e5"]
+        return any(model_name in self.embedding_model_name.lower() for model_name in e5_models)
 
     async def cleanup(self) -> None:
         if self.client is not None:

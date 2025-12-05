@@ -7,12 +7,14 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
+    networks:
+      - tfs-network
 
   minio:
     image: minio/minio:latest
     ports:
-      - "9000:9000"      # API
-      - "9001:9001"      # Console (Web UI)
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - ./minio_storage:/data
     environment:
@@ -22,17 +24,40 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    networks:
+      - tfs-network
 
-  # tg-bot:
-  #   build:
-  #     context: .
-  #     dockerfile: tg_bot/Dockerfile
-  #   environment:
-  #     - BOT_TOKEN=${BOT_TOKEN}
-  #     - API_BASE_URL=http://host.docker.internal:8000/api/v1
-  #   env_file:
-  #     - .env
-  #   depends_on:
-  #     - qdrant
-  #     - minio
-  #   restart: unless-stopped
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-admin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-admin12345678}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-documents}
+      - MINIO_SECURE=false
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CAILA_TOKEN=${CAILA_TOKEN}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/app/.cache/huggingface
+    env_file:
+      - .env
+    depends_on:
+      - qdrant
+      - minio
+    restart: unless-stopped
+    networks:
+      - tfs-network
+    volumes:
+      - ./qdrant_storage:/app/qdrant_storage
+      - ./minio_storage:/app/minio_storage
+      - ./huggingface_cache:/app/.cache/huggingface
+
+networks:
+  tfs-network:
+    driver: bridge

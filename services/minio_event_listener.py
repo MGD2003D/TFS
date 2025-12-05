@@ -3,6 +3,7 @@ import json
 from typing import Callable, Awaitable
 import tempfile
 import os
+import hashlib
 import app_state
 import threading
 import queue
@@ -138,10 +139,6 @@ class MinioEventListener:
         print(f"Обнаружен новый документ: {filename} (ID: {document_id})")
 
         try:
-            existing_docs = await app_state.vector_store.get_documents_list()
-            if any(doc['document_id'] == document_id for doc in existing_docs):
-                print(f"Документ {filename} уже проиндексирован, пропускаем")
-                return
             try:
                 response = self.minio_storage.client.get_object(
                     self.minio_storage.bucket_name,
@@ -154,6 +151,13 @@ class MinioEventListener:
                 print(f"Ошибка при скачивании {object_name}: {e}")
                 return
 
+            content_hash = hashlib.sha256(content).hexdigest()[:16]
+
+            existing_docs = await app_state.vector_store.get_documents_list()
+            if any(doc['document_id'] == content_hash for doc in existing_docs):
+                print(f"Документ {filename} уже проиндексирован (content hash: {content_hash}), пропускаем")
+                return
+
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
             temp_file.write(content)
             temp_file.close()
@@ -161,11 +165,11 @@ class MinioEventListener:
             try:
                 chunks, metadata = await app_state.document_indexer.process_pdf(
                     temp_file.name,
-                    document_id=document_id
+                    document_id=content_hash
                 )
                 await app_state.vector_store.add_documents(chunks, metadata)
 
-                print(f"Документ {filename} успешно проиндексирован ({len(chunks)} чанков)")
+                print(f"Документ {filename} успешно проиндексирован (content hash: {content_hash}, {len(chunks)} чанков)")
 
             finally:
                 if os.path.exists(temp_file.name):

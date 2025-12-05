@@ -8,7 +8,7 @@ import io
 
 class RAGService:
 
-    def __init__(self, min_relevance: float = 0.25, default_top_k: int = 5):
+    def __init__(self, min_relevance: float = 0.35, default_top_k: int = 8):
         self.min_relevance = min_relevance
         self.default_top_k = default_top_k
 
@@ -203,10 +203,27 @@ class RAGService:
 
     def _build_context(self, relevant_results: List[Dict]) -> str:
         context_parts = []
+        seen_sources = {}
+
         for i, doc in enumerate(relevant_results):
             source_info = doc['metadata'].get('source', 'неизвестно')
-            context_parts.append(f"[Источник {i+1} - {source_info}]:\n{doc['text']}")
-        return "\n\n".join(context_parts)
+            chunk_id = doc['metadata'].get('chunk_id', 0)
+            score = doc.get('score', 0)
+
+            if source_info not in seen_sources:
+                seen_sources[source_info] = []
+            seen_sources[source_info].append({
+                'text': doc['text'],
+                'chunk_id': chunk_id,
+                'score': score
+            })
+
+        for idx, (source, chunks) in enumerate(seen_sources.items(), 1):
+            context_parts.append(f"[Документ {idx}: {source}]")
+            for chunk in sorted(chunks, key=lambda x: x['chunk_id']):
+                context_parts.append(f"{chunk['text']}\n")
+
+        return "\n".join(context_parts)
 
     def _build_rag_prompt(self, context: str, query: str) -> str:
         return f"""Ты консультант туристического агентства. Используй ТОЛЬКО информацию из документов ниже для ответа.
