@@ -11,9 +11,11 @@ sys.path.insert(0, str(project_root))
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters.command import Command
+from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 from services.rag_service import RAGService
 from services.chat_service import ChatService
+from tg_bot.formatters import format_telegram_message
 # from texts import MESSAGES
 
 load_dotenv()
@@ -46,7 +48,9 @@ async def any_message(message: types.Message):
 
     result = await rag_service.chat_query(tg_id, message.text)
 
-    await message.answer(result["answer"])
+    formatted_answer = format_telegram_message(result["answer"])
+
+    await message.answer(formatted_answer, parse_mode=ParseMode.HTML)
 
 async def main():
     await dp.start_polling(bot)
