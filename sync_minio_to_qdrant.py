@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from services.minio_storage import MinioStorageService
 from services.vectorstore.qdrant_client import QdrantVectorStore
 from services.document_indexer import DocumentIndexer
+from services.document_types import temp_suffix_for
 
 load_dotenv()
 
@@ -79,12 +80,12 @@ async def sync_minio_to_qdrant():
             try:
                 content = await minio_storage.download_document(document_id, filename)
 
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(filename))
                 temp_file.write(content)
                 temp_file.close()
 
                 try:
-                    chunks, metadata = await document_indexer.process_pdf(
+                    chunks, metadata = await document_indexer.process_document(
                         temp_file.name,
                         document_id=document_id
                     )

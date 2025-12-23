@@ -7,6 +7,7 @@ import hashlib
 import app_state
 import threading
 import queue
+from services.document_types import is_supported_document, temp_suffix_for
 
 
 class MinioEventListener:
@@ -60,7 +61,7 @@ class MinioEventListener:
                 events = self.minio_storage.client.listen_bucket_notification(
                     bucket_name=self.minio_storage.bucket_name,
                     prefix="",
-                    suffix=".pdf",
+                    suffix="",
                     events=[
                         "s3:ObjectCreated:*",
                         "s3:ObjectRemoved:*"
@@ -125,6 +126,9 @@ class MinioEventListener:
                     print(f"Некорректный формат object_name: {object_name}")
                     continue
 
+                if not is_supported_document(filename):
+                    continue
+
                 if event_name.startswith('s3:ObjectCreated'):
                     await self._handle_object_created(document_id, filename, object_name)
                 elif event_name.startswith('s3:ObjectRemoved'):
@@ -158,12 +162,12 @@ class MinioEventListener:
                 print(f"Документ {filename} уже проиндексирован (content hash: {content_hash}), пропускаем")
                 return
 
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(filename))
             temp_file.write(content)
             temp_file.close()
 
             try:
-                chunks, metadata = await app_state.document_indexer.process_pdf(
+                chunks, metadata = await app_state.document_indexer.process_document(
                     temp_file.name,
                     document_id=content_hash
                 )

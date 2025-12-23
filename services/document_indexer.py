@@ -1,6 +1,8 @@
 from pypdf import PdfReader
+from docx import Document
 from typing import List, Dict, Any
 import os
+from services.document_types import normalize_extension
 
 
 class DocumentIndexer:
@@ -16,6 +18,26 @@ class DocumentIndexer:
         for page in reader.pages:
             text += page.extract_text() + "\n"
         return text
+
+    def extract_text_from_docx(self, docx_path: str) -> str:
+        doc = Document(docx_path)
+        text_parts = []
+
+        for paragraph in doc.paragraphs:
+            if paragraph.text:
+                text_parts.append(paragraph.text)
+
+        for table in doc.tables:
+            for row in table.rows:
+                row_cells = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    if cell_text:
+                        row_cells.append(cell_text)
+                if row_cells:
+                    text_parts.append("\t".join(row_cells))
+
+        return "\n".join(text_parts)
 
     def chunk_text(self, text: str) -> List[str]:
         chunks = []
@@ -62,14 +84,49 @@ class DocumentIndexer:
         print(f"Извлечено {len(chunks)} чанков из {pdf_path}")
         return chunks, metadata
 
-    async def process_multiple_pdfs(self, pdf_paths: List[str], document_ids: List[str] = None) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_docx(self, docx_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
+        if not os.path.exists(docx_path):
+            raise FileNotFoundError(f"File not found: {docx_path}")
+
+        text = self.extract_text_from_docx(docx_path)
+        chunks = self.chunk_text(text)
+
+        if document_id is None:
+            import hashlib
+            document_id = hashlib.sha256(os.path.basename(docx_path).encode()).hexdigest()[:16]
+
+        metadata = []
+        for idx, chunk in enumerate(chunks):
+            metadata.append({
+                "document_id": document_id,
+                "source": os.path.basename(docx_path),
+                "chunk_id": idx,
+                "total_chunks": len(chunks)
+            })
+
+        print(f"Extracted {len(chunks)} chunks from {docx_path}")
+        return chunks, metadata
+
+    async def process_document(self, file_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
+        ext = normalize_extension(file_path)
+        if ext == ".pdf":
+            return await self.process_pdf(file_path, document_id=document_id)
+        if ext == ".docx":
+            return await self.process_docx(file_path, document_id=document_id)
+
+        raise ValueError(f"Unsupported document type: {ext}")
+
+    async def process_multiple_documents(self, file_paths: List[str], document_ids: List[str] = None) -> tuple[List[str], List[Dict[str, Any]]]:
         all_chunks = []
         all_metadata = []
 
-        for idx, pdf_path in enumerate(pdf_paths):
+        for idx, file_path in enumerate(file_paths):
             document_id = document_ids[idx] if document_ids and idx < len(document_ids) else None
-            chunks, metadata = await self.process_pdf(pdf_path, document_id=document_id)
+            chunks, metadata = await self.process_document(file_path, document_id=document_id)
             all_chunks.extend(chunks)
             all_metadata.extend(metadata)
 
         return all_chunks, all_metadata
+
+    async def process_multiple_pdfs(self, pdf_paths: List[str], document_ids: List[str] = None) -> tuple[List[str], List[Dict[str, Any]]]:
+        return await self.process_multiple_documents(pdf_paths, document_ids=document_ids)

@@ -14,6 +14,7 @@ torchaudio
 qdrant-client
 sentence-transformers
 pypdf
+python-docx
 
 minio
 

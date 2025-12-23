@@ -7,6 +7,7 @@ from services.document_indexer import DocumentIndexer
 from services.minio_storage import MinioStorageService
 from services.minio_event_listener import MinioEventListener
 from services.startup_sync import sync_on_startup
+from services.chat_cleanup import ChatCleanupWorker
 import app_state
 import os
 import asyncio
@@ -18,7 +19,7 @@ app = FastAPI()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global llm_client, vector_store, document_indexer, minio_storage, minio_event_listener, bot_task
+    global llm_client, vector_store, document_indexer, minio_storage, minio_event_listener, bot_task, chat_cleanup_worker
 
     print("\n=== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ===")
 
@@ -55,6 +56,14 @@ async def lifespan(app: FastAPI):
     app_state.document_indexer = document_indexer
     print("Document Indexer готов")
 
+    print("\nStarting chat cleanup worker...")
+    chat_cleanup_worker = ChatCleanupWorker(
+        ttl_seconds=int(os.getenv("CHAT_TTL_SECONDS", "3600")),
+        interval_seconds=int(os.getenv("CHAT_CLEANUP_INTERVAL_SECONDS", "60"))
+    )
+    await chat_cleanup_worker.start()
+    print("Chat cleanup worker started")
+
     print("\n5/7 Синхронизация MinIO -> Qdrant...")
     await sync_on_startup(minio_storage, vector_store, document_indexer)
     print("Синхронизация завершена")
@@ -83,6 +92,9 @@ async def lifespan(app: FastAPI):
             await bot_task
         except asyncio.CancelledError:
             pass
+
+    if chat_cleanup_worker:
+        await chat_cleanup_worker.stop()
 
     await llm_client.cleanup()
     await vector_store.cleanup()

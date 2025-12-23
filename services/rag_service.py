@@ -4,6 +4,8 @@ from fastapi import UploadFile
 import tempfile
 import os
 import io
+import time
+from services.document_types import is_supported_document, temp_suffix_for
 
 
 class RAGService:
@@ -13,8 +15,8 @@ class RAGService:
         self.default_top_k = default_top_k
 
     async def upload_and_index_document(self, file: UploadFile) -> Dict:
-        if not file.filename.endswith('.pdf'):
-            raise ValueError(f"Файл {file.filename} не является PDF")
+        if not is_supported_document(file.filename or ""):
+            raise ValueError(f"Unsupported file type: {file.filename}. Only .pdf and .docx are supported.")
 
         content = await file.read()
         file_obj = io.BytesIO(content)
@@ -22,12 +24,12 @@ class RAGService:
         minio_result = await app_state.minio_storage.upload_document(file_obj, file.filename)
         document_id = minio_result["document_id"]
 
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(file.filename or ""))
         temp_file.write(content)
         temp_file.close()
 
         try:
-            chunks, metadata = await app_state.document_indexer.process_pdf(temp_file.name, document_id=document_id)
+            chunks, metadata = await app_state.document_indexer.process_document(temp_file.name, document_id=document_id)
             await app_state.vector_store.add_documents(chunks, metadata)
 
             return {
@@ -51,16 +53,16 @@ class RAGService:
 
         try:
             for file in files:
-                if not file.filename.endswith('.pdf'):
-                    raise ValueError(f"Файл {file.filename} не является PDF")
+                if not is_supported_document(file.filename or ""):
+                    raise ValueError(f"Unsupported file type: {file.filename}. Only .pdf and .docx are supported.")
 
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(file.filename or ""))
                 content = await file.read()
                 temp_file.write(content)
                 temp_file.close()
                 temp_files.append(temp_file.name)
 
-            chunks, metadata = await app_state.document_indexer.process_multiple_pdfs(temp_files)
+            chunks, metadata = await app_state.document_indexer.process_multiple_documents(temp_files)
             await app_state.vector_store.add_documents(chunks, metadata)
 
             return len(files), len(chunks)
@@ -71,29 +73,47 @@ class RAGService:
                     os.unlink(temp_file)
 
     async def query(self, query: str, top_k: int = None) -> Dict:
+        total_start = time.perf_counter()
         if top_k is None:
             top_k = self.default_top_k
 
+        search_start = time.perf_counter()
         search_results = await app_state.vector_store.search(query, top_k=top_k)
+        search_time = time.perf_counter() - search_start
 
         if not search_results:
+            total_time = time.perf_counter() - total_start
+            print(f"[timing] rag_query: search={search_time:.3f}s total={total_time:.3f}s (no_results)")
             return {
                 "answer": "К сожалению, в базе знаний нет информации, которая могла бы помочь ответить на ваш вопрос.",
                 "sources": []
             }
 
+        filter_start = time.perf_counter()
         relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
+        filter_time = time.perf_counter() - filter_start
 
         if not relevant_results:
+            total_time = time.perf_counter() - total_start
+            print(
+                "[timing] rag_query: "
+                f"search={search_time:.3f}s "
+                f"filter={filter_time:.3f}s "
+                f"total={total_time:.3f}s (no_relevant)"
+            )
             return {
                 "answer": "К сожалению, в базе знаний нет информации, которая могла бы помочь ответить на ваш вопрос.",
                 "sources": []
             }
 
+        context_start = time.perf_counter()
         context = self._build_context(relevant_results)
         rag_prompt = self._build_rag_prompt(context, query)
+        context_time = time.perf_counter() - context_start
 
+        llm_start = time.perf_counter()
         answer = await app_state.llm_client.simple_query(rag_prompt)
+        llm_time = time.perf_counter() - llm_start
 
         sources = [{
             "text": doc["text"][:200] + "...",
@@ -101,40 +121,68 @@ class RAGService:
             "metadata": doc["metadata"]
         } for doc in relevant_results]
 
+        total_time = time.perf_counter() - total_start
+        print(
+            "[timing] rag_query: "
+            f"search={search_time:.3f}s "
+            f"filter={filter_time:.3f}s "
+            f"context={context_time:.3f}s "
+            f"llm={llm_time:.3f}s "
+            f"total={total_time:.3f}s"
+        )
         return {
             "answer": answer,
             "sources": sources
         }
 
     async def chat_query(self, user_id: str, query: str, top_k: int = None) -> Dict:
+        total_start = time.perf_counter()
         if top_k is None:
             top_k = self.default_top_k
 
+        search_start = time.perf_counter()
         search_results = await app_state.vector_store.search(query, top_k=top_k)
+        search_time = time.perf_counter() - search_start
 
         if not search_results:
             app_state.add_role_message(user_id, query, role="user")
             history = app_state.get_user_messages(user_id)
+            llm_start = time.perf_counter()
             answer = await app_state.llm_client.chat_query(history)
+            llm_time = time.perf_counter() - llm_start
             app_state.add_role_message(user_id, answer, role="assistant")
+            total_time = time.perf_counter() - total_start
+            print(
+                "[timing] rag_chat: "
+                f"search={search_time:.3f}s "
+                f"llm={llm_time:.3f}s "
+                f"total={total_time:.3f}s (no_results)"
+            )
             return {"answer": answer, "sources": []}
 
+        filter_start = time.perf_counter()
         relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
+        filter_time = time.perf_counter() - filter_start
 
+        context_time = 0.0
         if relevant_results:
+            context_start = time.perf_counter()
             context = self._build_context(relevant_results)
             user_message = f"""=== РЕЛЕВАНТНАЯ ИНФОРМАЦИЯ ИЗ БД ===
 {context}
 
 === ВОПРОС ===
 {query}"""
+            context_time = time.perf_counter() - context_start
         else:
             user_message = query
 
         app_state.add_role_message(user_id, user_message, role="user")
         history = app_state.get_user_messages(user_id)
 
+        llm_start = time.perf_counter()
         answer = await app_state.llm_client.chat_query(history)
+        llm_time = time.perf_counter() - llm_start
         app_state.add_role_message(user_id, answer, role="assistant")
 
         sources = [{
@@ -143,6 +191,15 @@ class RAGService:
             "metadata": doc["metadata"]
         } for doc in relevant_results] if relevant_results else []
 
+        total_time = time.perf_counter() - total_start
+        print(
+            "[timing] rag_chat: "
+            f"search={search_time:.3f}s "
+            f"filter={filter_time:.3f}s "
+            f"context={context_time:.3f}s "
+            f"llm={llm_time:.3f}s "
+            f"total={total_time:.3f}s"
+        )
         return {
             "answer": answer,
             "sources": sources

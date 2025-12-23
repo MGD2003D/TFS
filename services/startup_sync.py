@@ -1,6 +1,7 @@
 import tempfile
 import os
 import hashlib
+from services.document_types import temp_suffix_for
 
 
 async def sync_on_startup(minio_storage, vector_store, document_indexer):
@@ -54,12 +55,12 @@ async def sync_on_startup(minio_storage, vector_store, document_indexer):
                 print(f"  [{idx}/{len(missing_in_qdrant)}] {filename} (hash: {content_hash})")
 
                 try:
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(filename))
                     temp_file.write(content)
                     temp_file.close()
 
                     try:
-                        chunks, metadata = await document_indexer.process_pdf(
+                        chunks, metadata = await document_indexer.process_document(
                             temp_file.name,
                             document_id=content_hash
                         )

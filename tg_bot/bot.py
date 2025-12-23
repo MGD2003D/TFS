@@ -5,13 +5,14 @@ import sys
 import asyncio
 import logging
 from pathlib import Path
+from contextlib import suppress
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters.command import Command
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatAction
 from dotenv import load_dotenv
 from services.rag_service import RAGService
 from services.chat_service import ChatService
@@ -30,6 +31,15 @@ dp = Dispatcher()
 rag_service = RAGService(min_relevance=0.25, default_top_k=5)
 chat_service = ChatService()
 
+
+async def _typing_indicator(chat_id: int) -> None:
+    try:
+        while True:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     tg_id = message.from_user.id
@@ -46,7 +56,13 @@ async def upload_pdf(message: types.Message):
 async def any_message(message: types.Message):
     tg_id = message.from_user.id
 
-    result = await rag_service.chat_query(tg_id, message.text)
+    typing_task = asyncio.create_task(_typing_indicator(message.chat.id))
+    try:
+        result = await rag_service.chat_query(tg_id, message.text)
+    finally:
+        typing_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await typing_task
 
     formatted_answer = format_telegram_message(result["answer"])
 

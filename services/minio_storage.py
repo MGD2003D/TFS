@@ -4,6 +4,7 @@ from typing import List, Dict, BinaryIO
 import io
 import hashlib
 from datetime import datetime
+from services.document_types import get_content_type
 
 
 class MinioStorageService:
@@ -63,7 +64,7 @@ class MinioStorageService:
             object_name=object_name,
             data=io.BytesIO(content),
             length=len(content),
-            content_type="application/pdf"
+            content_type=get_content_type(filename)
         )
 
         print(f"Документ {filename} загружен в MinIO с ID: {document_id}")
