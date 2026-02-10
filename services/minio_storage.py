@@ -86,8 +86,15 @@ class MinioStorageService:
             response.close()
             response.release_conn()
             return data
-        except S3Error as e:
-            raise FileNotFoundError(f"Документ {filename} (ID: {document_id}) не найден в MinIO") from e
+        except S3Error:
+            try:
+                response = self.client.get_object(self.bucket_name, filename)
+                data = response.read()
+                response.close()
+                response.release_conn()
+                return data
+            except S3Error as e:
+                raise FileNotFoundError(f"Документ {filename} (ID: {document_id}) не найден в MinIO") from e
 
     async def delete_document(self, document_id: str, filename: str) -> None:
         object_name = f"{document_id}/{filename}"
@@ -95,6 +102,13 @@ class MinioStorageService:
         try:
             self.client.remove_object(self.bucket_name, object_name)
             print(f"Документ {filename} (ID: {document_id}) удален из MinIO")
+            return
+        except S3Error:
+            pass
+
+        try:
+            self.client.remove_object(self.bucket_name, filename)
+            print(f"Документ {filename} (ID: {document_id}) удален из MinIO (legacy формат)")
         except S3Error as e:
             print(f"Ошибка при удалении документа: {e}")
 
@@ -102,8 +116,14 @@ class MinioStorageService:
         documents = []
         objects = self.client.list_objects(self.bucket_name, recursive=True)
 
+        total_objects = 0
         for obj in objects:
+            total_objects += 1
             parts = obj.object_name.split('/', 1)
+
+            if total_objects <= 5:
+                print(f"[MinIO Debug] Object {total_objects}: '{obj.object_name}' -> parts: {parts}")
+
             if len(parts) == 2:
                 document_id, filename = parts
                 documents.append({
@@ -113,7 +133,26 @@ class MinioStorageService:
                     "size": obj.size,
                     "last_modified": obj.last_modified.isoformat() if obj.last_modified else None
                 })
+            elif len(parts) == 1:
+                filename = parts[0]
+                document_id = self.generate_document_id(filename)
 
+                if total_objects <= 5:
+                    print(f"[MinIO Debug] 📄 Legacy файл: '{filename}' -> ID: {document_id}")
+
+                documents.append({
+                    "document_id": document_id,
+                    "filename": filename,
+                    "object_name": obj.object_name,
+                    "size": obj.size,
+                    "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+                    "legacy": True
+                })
+
+        print(f"[MinIO Debug] Всего объектов в bucket: {total_objects}, распознано документов: {len(documents)}")
+        legacy_count = sum(1 for doc in documents if doc.get('legacy'))
+        if legacy_count > 0:
+            print(f"[MinIO Debug] Legacy файлов (без document_id): {legacy_count}")
         return documents
 
     async def document_exists(self, document_id: str, filename: str) -> bool:
@@ -121,6 +160,12 @@ class MinioStorageService:
 
         try:
             self.client.stat_object(self.bucket_name, object_name)
+            return True
+        except S3Error:
+            pass
+
+        try:
+            self.client.stat_object(self.bucket_name, filename)
             return True
         except S3Error:
             return False

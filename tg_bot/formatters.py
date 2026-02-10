@@ -11,17 +11,18 @@ def format_telegram_message(text: str) -> str:
     think_pattern = r'<think>(.*?)</think>'
     think_match = re.search(think_pattern, text, re.DOTALL)
 
-    think_section = ""
+    # think_section = ""
     main_content = text
 
     if think_match:
-        think_content = think_match.group(1).strip()
-        think_section = f"<blockquote>{think_content}</blockquote>\n\n"
+        # think_content = think_match.group(1).strip()
+        # think_section = f"<blockquote>{think_content}</blockquote>\n\n"
         main_content = re.sub(think_pattern, '', text, flags=re.DOTALL).strip()
 
     main_content = convert_markdown_to_html(main_content)
 
-    return think_section + main_content
+    # return think_section + main_content
+    return main_content
 
 
 def convert_markdown_to_html(text: str) -> str:

@@ -61,7 +61,7 @@ class DocumentIndexer:
 
         return [c for c in chunks if c]
 
-    async def process_pdf(self, pdf_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_pdf(self, pdf_path: str, document_id: str = None, original_filename: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF файл не найден: {pdf_path}")
 
@@ -72,11 +72,13 @@ class DocumentIndexer:
             import hashlib
             document_id = hashlib.sha256(os.path.basename(pdf_path).encode()).hexdigest()[:16]
 
+        source_name = original_filename if original_filename else os.path.basename(pdf_path)
+
         metadata = []
         for idx, chunk in enumerate(chunks):
             metadata.append({
                 "document_id": document_id,
-                "source": os.path.basename(pdf_path),
+                "source": source_name,
                 "chunk_id": idx,
                 "total_chunks": len(chunks)
             })
@@ -84,7 +86,7 @@ class DocumentIndexer:
         print(f"Извлечено {len(chunks)} чанков из {pdf_path}")
         return chunks, metadata
 
-    async def process_docx(self, docx_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_docx(self, docx_path: str, document_id: str = None, original_filename: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
         if not os.path.exists(docx_path):
             raise FileNotFoundError(f"File not found: {docx_path}")
 
@@ -95,11 +97,13 @@ class DocumentIndexer:
             import hashlib
             document_id = hashlib.sha256(os.path.basename(docx_path).encode()).hexdigest()[:16]
 
+        source_name = original_filename if original_filename else os.path.basename(docx_path)
+
         metadata = []
         for idx, chunk in enumerate(chunks):
             metadata.append({
                 "document_id": document_id,
-                "source": os.path.basename(docx_path),
+                "source": source_name,
                 "chunk_id": idx,
                 "total_chunks": len(chunks)
             })
@@ -107,12 +111,12 @@ class DocumentIndexer:
         print(f"Extracted {len(chunks)} chunks from {docx_path}")
         return chunks, metadata
 
-    async def process_document(self, file_path: str, document_id: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
+    async def process_document(self, file_path: str, document_id: str = None, original_filename: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
         ext = normalize_extension(file_path)
         if ext == ".pdf":
-            return await self.process_pdf(file_path, document_id=document_id)
+            return await self.process_pdf(file_path, document_id=document_id, original_filename=original_filename)
         if ext == ".docx":
-            return await self.process_docx(file_path, document_id=document_id)
+            return await self.process_docx(file_path, document_id=document_id, original_filename=original_filename)
 
         raise ValueError(f"Unsupported document type: {ext}")
 

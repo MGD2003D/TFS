@@ -1,7 +1,8 @@
 import aiohttp
 import os
+import json
 from .base import BaseLLMClient
-from typing import List, Dict
+from typing import List, Dict, Optional
 from app_state import system_prompt
 
 
@@ -78,3 +79,68 @@ class CailaClient(BaseLLMClient):
         except Exception as e:
             print(f"Неожиданная ошибка: {e}")
             raise
+
+    async def extract_aspects(self, query: str) -> Optional[Dict[str, str]]:
+        """
+        Извлекает аспекты из запроса для query decomposition.
+
+        Args:
+            query: Пользовательский запрос
+
+        Returns:
+            Dict[aspect_name, search_query] или None при ошибке
+            - Простой запрос: {"original": "query"}
+            - Сложный запрос: {"original": "query", "aspect1": "...", ...}
+        """
+        from prompts_config import build_aspect_extraction_prompt
+
+        try:
+            prompt = build_aspect_extraction_prompt(query)
+            response = await self.simple_query(prompt)
+
+            response_clean = response.strip()
+
+            if "<think>" in response_clean and "</think>" in response_clean:
+                response_clean = response_clean.split("</think>", 1)[1].strip()
+
+            if response_clean.startswith("```json"):
+                response_clean = response_clean[7:]
+            if response_clean.startswith("```"):
+                response_clean = response_clean[3:]
+            if response_clean.endswith("```"):
+                response_clean = response_clean[:-3]
+            response_clean = response_clean.strip()
+
+            aspects = json.loads(response_clean)
+
+            if not isinstance(aspects, dict):
+                print(f"[ASPECT EXTRACTION] Invalid format (not dict): {aspects}")
+                return None
+
+            if "original" not in aspects:
+                print(f"[ASPECT EXTRACTION] Missing 'original' key, adding it")
+                aspects["original"] = query
+
+            if "aspects" in aspects and isinstance(aspects["aspects"], dict):
+                nested_aspects = aspects.pop("aspects")
+                aspects.update(nested_aspects)
+                print(f"[ASPECT EXTRACTION] Unpacked nested 'aspects' dict")
+
+            invalid_keys = [k for k, v in aspects.items() if not isinstance(v, str)]
+            if invalid_keys:
+                print(f"[ASPECT EXTRACTION] Invalid non-string values for keys: {invalid_keys}")
+                return None
+
+            print(f"[ASPECT EXTRACTION] Extracted {len(aspects)} aspects")
+            for aspect_name, aspect_query in aspects.items():
+                print(f"  - {aspect_name}: {aspect_query}")
+
+            return aspects
+
+        except json.JSONDecodeError as e:
+            print(f"[ASPECT EXTRACTION] JSON parse error: {e}")
+            print(f"[ASPECT EXTRACTION] Response was: {response[:200]}...")
+            return None
+        except Exception as e:
+            print(f"[ASPECT EXTRACTION] Unexpected error: {e}")
+            return None

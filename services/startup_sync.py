@@ -62,7 +62,8 @@ async def sync_on_startup(minio_storage, vector_store, document_indexer):
                     try:
                         chunks, metadata = await document_indexer.process_document(
                             temp_file.name,
-                            document_id=content_hash
+                            document_id=content_hash,
+                            original_filename=filename
                         )
                         await vector_store.add_documents(chunks, metadata)
                         print(f"\

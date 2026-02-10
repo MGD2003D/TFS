@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from typing import List
 from services.rag_service import RAGService
+import os
 
 
 class DocumentUploadResponse(BaseModel):
@@ -29,7 +30,15 @@ class DocumentListResponse(BaseModel):
 
 
 router = APIRouter()
-rag_service = RAGService(min_relevance=0.25, default_top_k=5)
+
+# Флаг для включения/выключения query enhancement
+enable_query_enhancement = os.getenv('ENABLE_QUERY_ENHANCEMENT', 'true').lower() == 'true'
+
+rag_service = RAGService(
+    min_relevance=0.25,
+    default_top_k=5,
+    enable_query_enhancement=enable_query_enhancement
+)
 
 
 @router.post("/upload", response_model=DocumentUploadResponse)
