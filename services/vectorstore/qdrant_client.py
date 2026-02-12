@@ -122,7 +122,12 @@ class QdrantVectorStore(BaseVectorStore):
         self.sparse_encoder.build_vocab(texts)
         self.sparse_vocab_ready = True
 
-    async def add_documents(self, texts: List[str], metadata: List[Dict[str, Any]] = None) -> None:
+    async def add_documents(
+        self,
+        texts: List[str],
+        metadata: List[Dict[str, Any]] = None,
+        namespace: str = "default"
+    ) -> None:
         if not texts:
             return
 
@@ -160,6 +165,9 @@ class QdrantVectorStore(BaseVectorStore):
             point_metadata = metadata[idx] if metadata and idx < len(metadata) else {}
             point_metadata["text"] = text
 
+            if "namespace" not in point_metadata:
+                point_metadata["namespace"] = namespace
+
             if self.enable_hybrid_search and self.sparse_encoder:
                 sparse_vector = self.sparse_encoder.encode(text)
 
@@ -191,38 +199,77 @@ class QdrantVectorStore(BaseVectorStore):
         )
 
         if self.enable_hybrid_search:
-            print(f"Добавлено {len(points)} чанков в {self.collection_name} (hybrid: dense + sparse)")
+            print(f"Добавлено {len(points)} чанков в {self.collection_name} (hybrid: dense + sparse) [namespace: {point_metadata.get('namespace', namespace)}]")
         else:
-            print(f"Добавлено {len(points)} чанков в {self.collection_name}")
+            print(f"Добавлено {len(points)} чанков в {self.collection_name} [namespace: {point_metadata.get('namespace', namespace)}]")
 
 
-    async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def _build_namespace_filter(self, namespaces: List[str] = None):
+
+        if not namespaces:
+            return None
+
+        if len(namespaces) == 1:
+            return models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="namespace",
+                        match=models.MatchValue(value=namespaces[0])
+                    )
+                ]
+            )
+        else:
+            return models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="namespace",
+                        match=models.MatchValue(value=ns)
+                    )
+                    for ns in namespaces
+                ]
+            )
+
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        namespaces: List[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Поиск документов. Автоматически использует hybrid search если включен.
         """
         if self.enable_hybrid_search and self.sparse_encoder:
-            return await self.hybrid_search(query, top_k=top_k)
+            return await self.hybrid_search_rrf(query, top_k=top_k, namespaces=namespaces)
         else:
-            return await self.dense_search(query, top_k=top_k)
+            return await self.dense_search(query, top_k=top_k, namespaces=namespaces)
 
-    async def dense_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def dense_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        namespaces: List[str] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Обычный dense vector search (семантический поиск).
+        Обычный dense vector search (семантический поиск) с namespace filtering.
         """
         prefixed_query = f"query: {query}" if self._use_prefixes() else query
         query_vector = self.embedding_model.encode([prefixed_query], normalize_embeddings=True)[0]
+
+        query_filter = self._build_namespace_filter(namespaces)
 
         if self.enable_hybrid_search:
             search_result = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_vector.tolist(),
                 using="dense",
+                query_filter=query_filter,
                 limit=top_k
             )
         else:
             search_result = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_vector.tolist(),
+                query_filter=query_filter,
                 limit=top_k
             )
 
@@ -237,9 +284,14 @@ class QdrantVectorStore(BaseVectorStore):
 
         return results
 
-    async def sparse_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def sparse_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        namespaces: List[str] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Sparse (BM25) search only.
+        Sparse (BM25) search only with namespace filtering.
         """
         if not self.sparse_encoder:
             print("[WARN] Sparse encoder not initialized, returning empty results")
@@ -249,6 +301,8 @@ class QdrantVectorStore(BaseVectorStore):
         if not sparse_vector:
             return []
 
+        query_filter = self._build_namespace_filter(namespaces)
+
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=models.SparseVector(
@@ -256,6 +310,7 @@ class QdrantVectorStore(BaseVectorStore):
                 values=list(sparse_vector.values())
             ),
             using="sparse",
+            query_filter=query_filter,
             limit=top_k
         )
 
@@ -275,23 +330,27 @@ class QdrantVectorStore(BaseVectorStore):
         query: str,
         top_k: int = 5,
         dense_weight: float = 0.5,
-        sparse_weight: float = 0.5
+        sparse_weight: float = 0.5,
+        namespaces: List[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Hybrid search: комбинирует dense (семантический) и sparse (BM25) поиск.
+        Hybrid search: комбинирует dense (семантический) и sparse (BM25) поиск с namespace filtering.
 
         Args:
             query: Поисковый запрос
             top_k: Количество результатов
             dense_weight: Вес dense поиска (0.0-1.0)
             sparse_weight: Вес sparse поиска (0.0-1.0)
+            namespaces: Список namespaces для фильтрации (None = все документы)
 
         Returns:
             Список результатов с объединенными скорами
         """
         if not self.sparse_encoder:
             print("[WARN] Sparse encoder not initialized, falling back to dense search")
-            return await self.dense_search(query, top_k=top_k)
+            return await self.dense_search(query, top_k=top_k, namespaces=namespaces)
+
+        query_filter = self._build_namespace_filter(namespaces)
 
         prefixed_query = f"query: {query}" if self._use_prefixes() else query
         dense_vector = self.embedding_model.encode([prefixed_query], normalize_embeddings=True)[0]
@@ -300,10 +359,10 @@ class QdrantVectorStore(BaseVectorStore):
             collection_name=self.collection_name,
             query=dense_vector.tolist(),
             using="dense",
+            query_filter=query_filter,
             limit=top_k * 2
         )
 
-        # 2. Sparse vector search (BM25)
         sparse_vector = self.sparse_encoder.encode_query(query)
 
         if sparse_vector:
@@ -314,6 +373,7 @@ class QdrantVectorStore(BaseVectorStore):
                     values=list(sparse_vector.values())
                 ),
                 using="sparse",
+                query_filter=query_filter,
                 limit=top_k * 2
             )
         else:
@@ -321,7 +381,6 @@ class QdrantVectorStore(BaseVectorStore):
                 points = []
             sparse_results = EmptyResults()
 
-        # 3. Merge и rerank результатов
         results_map = {}
 
         for point in dense_results.points:
@@ -368,15 +427,18 @@ class QdrantVectorStore(BaseVectorStore):
         top_k: int = 5,
         rrf_k: int = 60,
         pool_k: int = None,
+        namespaces: List[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Гибридный поиск с RRF
+        Гибридный поиск с RRF и namespace filtering
         """
         if not self.sparse_encoder:
             print("[WARN] Sparse encoder not initialized, falling back to dense search")
-            return await self.dense_search(query, top_k=top_k)
+            return await self.dense_search(query, top_k=top_k, namespaces=namespaces)
 
         pool_k = pool_k or max(top_k * 5, top_k)
+
+        query_filter = self._build_namespace_filter(namespaces)
 
         prefixed_query = f"query: {query}" if self._use_prefixes() else query
         dense_vector = self.embedding_model.encode([prefixed_query], normalize_embeddings=True)[0]
@@ -385,10 +447,10 @@ class QdrantVectorStore(BaseVectorStore):
             collection_name=self.collection_name,
             query=dense_vector.tolist(),
             using="dense",
+            query_filter=query_filter,
             limit=pool_k
         )
 
-        # 2. Sparse vector search (BM25)
         sparse_vector = self.sparse_encoder.encode_query(query)
 
         if sparse_vector:
@@ -399,6 +461,7 @@ class QdrantVectorStore(BaseVectorStore):
                     values=list(sparse_vector.values())
                 ),
                 using="sparse",
+                query_filter=query_filter,
                 limit=pool_k
             )
         else:
@@ -410,21 +473,23 @@ class QdrantVectorStore(BaseVectorStore):
         results_map = {}
 
         for rank, point in enumerate(dense_results.points, 1):
+            rrf_score = 1.0 / (rrf_k + rank)
             results_map[point.id] = {
                 "text": point.payload.get("text", ""),
                 "metadata": {k: v for k, v in point.payload.items() if k != "text"},
-                "rrf_score": 1.0 / (rrf_k + rank),
+                "rrf_score": rrf_score,
                 "search_type": "rrf",
             }
 
         for rank, point in enumerate(sparse_results.points, 1):
+            rrf_score = 1.0 / (rrf_k + rank)
             if point.id in results_map:
-                results_map[point.id]["rrf_score"] += 1.0 / (rrf_k + rank)
+                results_map[point.id]["rrf_score"] += rrf_score
             else:
                 results_map[point.id] = {
                     "text": point.payload.get("text", ""),
                     "metadata": {k: v for k, v in point.payload.items() if k != "text"},
-                    "rrf_score": 1.0 / (rrf_k + rank),
+                    "rrf_score": rrf_score,
                     "search_type": "rrf",
                 }
 

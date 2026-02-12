@@ -17,14 +17,48 @@ class RAGService:
         self.default_top_k = default_top_k
         self.enable_query_enhancement = enable_query_enhancement
 
-    async def upload_and_index_document(self, file: UploadFile) -> Dict:
+    def _resolve_namespace(self, user_id: str, is_corporate: bool) -> str:
+
+        return "corporate" if is_corporate else f"user_{user_id}"
+
+    def _resolve_namespaces(self, user_id: str, scope: str) -> List[str]:
+
+        if scope == "personal":
+            return [f"user_{user_id}"]
+        elif scope == "corporate":
+            return ["corporate"]
+        elif scope == "personal_corporate":
+            return [f"user_{user_id}", "corporate"]
+        else:
+            return [f"user_{user_id}", "corporate"]
+
+    async def upload_and_index_document(
+        self,
+        file: UploadFile,
+        user_id: str = None,
+        is_corporate: bool = False
+    ) -> Dict:
+
         if not is_supported_document(file.filename or ""):
             raise ValueError(f"Unsupported file type: {file.filename}. Only .pdf and .docx are supported.")
 
         content = await file.read()
         file_obj = io.BytesIO(content)
 
-        minio_result = await app_state.minio_storage.upload_document(file_obj, file.filename)
+        namespace = self._resolve_namespace(user_id, is_corporate)
+
+        minio_metadata = {
+            "user_id": user_id,
+            "is_corporate": str(is_corporate),
+            "uploaded_by": user_id
+        }
+
+        minio_result = await app_state.minio_storage.upload_document(
+            file_obj,
+            file.filename,
+            namespace=namespace,
+            metadata=minio_metadata
+        )
         document_id = minio_result["document_id"]
 
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(file.filename or ""))
@@ -33,13 +67,32 @@ class RAGService:
 
         try:
             chunks, metadata = await app_state.document_indexer.process_document(temp_file.name, document_id=document_id)
-            await app_state.vector_store.add_documents(chunks, metadata)
+
+            namespace = self._resolve_namespace(user_id, is_corporate)
+
+            from datetime import datetime
+            for meta in metadata:
+                meta["user_id"] = user_id
+                meta["is_corporate"] = is_corporate
+                meta["namespace"] = namespace
+                meta["uploaded_by"] = user_id
+                if "uploaded_at" not in meta:
+                    meta["uploaded_at"] = datetime.now().isoformat()
+
+            await app_state.vector_store.add_documents(
+                chunks,
+                metadata,
+                namespace=namespace
+            )
 
             return {
                 "document_id": document_id,
                 "filename": file.filename,
                 "chunks_indexed": len(chunks),
                 "size": minio_result["size"],
+                "bucket_name": minio_result["bucket_name"],
+                "namespace": minio_result["namespace"],
+                "is_corporate": is_corporate,
                 "uploaded_at": minio_result["uploaded_at"]
             }
 
@@ -75,13 +128,14 @@ class RAGService:
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
 
-    async def query(self, query: str, top_k: int = None) -> Dict:
+    async def query(self, query: str, top_k: int = None, namespaces: List[str] = None) -> Dict:
+
         total_start = time.perf_counter()
         if top_k is None:
             top_k = self.default_top_k
 
         search_start = time.perf_counter()
-        search_results = await app_state.vector_store.search(query, top_k=top_k)
+        search_results = await app_state.vector_store.search(query, top_k=top_k, namespaces=namespaces)
         search_time = time.perf_counter() - search_start
 
         print(f"\n{'='*80}")
@@ -157,7 +211,14 @@ class RAGService:
             "sources": sources
         }
 
-    async def chat_query(self, user_id: str, query: str, top_k: int = None) -> Dict:
+    async def chat_query(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = None,
+        scope: str = "personal_corporate"
+    ) -> Dict:
+
         total_start = time.perf_counter()
         if top_k is None:
             top_k = self.default_top_k
@@ -233,6 +294,8 @@ class RAGService:
         else:
             search_queries = [query]
 
+        namespaces = self._resolve_namespaces(user_id, scope)
+
         search_start = time.perf_counter()
         all_results = []
         seen_texts = set()
@@ -240,7 +303,11 @@ class RAGService:
         for idx, search_query in enumerate(search_queries, 1):
             if len(search_queries) > 1:
                 print(f"[MULTI-QUERY SEARCH] Query {idx}/{len(search_queries)}: {search_query}")
-            results = await app_state.vector_store.search(search_query, top_k=top_k)
+            results = await app_state.vector_store.search(
+                search_query,
+                top_k=top_k,
+                namespaces=namespaces
+            )
 
             for result in results:
                 text_key = result['text'][:100]
@@ -353,12 +420,44 @@ class RAGService:
             "sources": sources
         }
 
-    async def delete_document(self, document_id: str, filename: str) -> None:
+    async def delete_document(self, document_id: str, filename: str, user_id: str) -> None:
+
+        from qdrant_client import models
+
+        scroll_result = app_state.vector_store.client.scroll(
+            collection_name=app_state.vector_store.collection_name,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchValue(value=document_id)
+                    )
+                ]
+            ),
+            limit=1,
+            with_payload=True
+        )
+
+        if not scroll_result[0]:
+            raise ValueError(f"Document {document_id} not found")
+
+        doc_metadata = scroll_result[0][0].payload
+
+        if doc_metadata.get("is_corporate"):
+            pass
+        elif doc_metadata.get("user_id") != user_id:
+            raise PermissionError("Cannot delete other users' personal documents")
+
         await app_state.vector_store.delete_by_document_id(document_id)
 
-        await app_state.minio_storage.delete_document(document_id, filename)
+        bucket_name = (
+            "documents-corporate" if doc_metadata.get("is_corporate")
+            else f"documents-user-{doc_metadata.get('user_id')}"
+        )
 
-        print(f"Документ {filename} (ID: {document_id}) полностью удален")
+        await app_state.minio_storage.delete_document(document_id, filename, bucket_name)
+
+        print(f"Документ {filename} (ID: {document_id}) полностью удален [bucket: {bucket_name}]")
 
     async def replace_document(self, document_id: str, old_filename: str, new_file: UploadFile) -> Dict:
         await self.delete_document(document_id, old_filename)
@@ -368,8 +467,15 @@ class RAGService:
         print(f"Документ {old_filename} заменен на {new_file.filename}")
         return result
 
-    async def list_documents(self) -> List[Dict]:
-        minio_docs = await app_state.minio_storage.list_documents()
+    async def list_documents(
+        self,
+        user_id: str = None,
+        scope: str = "personal_corporate"
+    ) -> List[Dict]:
+
+        namespaces = self._resolve_namespaces(user_id, scope) if user_id else None
+
+        minio_docs = await app_state.minio_storage.list_documents(namespaces=namespaces)
         qdrant_docs = await app_state.vector_store.get_documents_list()
 
         docs_map = {}
@@ -442,27 +548,21 @@ class RAGService:
 
         query_lower = query.lower()
 
-        # Приветствия
         if any(word in query_lower for word in ["привет", "здравствуй", "добрый день", "добрый вечер", "доброе утро", "хай", "хэй"]):
             answer = f"{ce.wave()} Привет! Я помогу вам подобрать тур {ce.plane()}. Спросите меня о наших направлениях или конкретных турах!"
 
-        # Как дела
         elif any(phrase in query_lower for phrase in ["как дела", "как ты", "как поживаешь", "что нового"]):
             answer = f"Всё отлично, спасибо! {ce.sparkles()} Готов помочь вам с подбором тура. Какое направление вас интересует?"
 
-        # Благодарности
         elif any(word in query_lower for word in ["спасибо", "благодарю", "thanks", "пасиб"]):
             answer = f"{ce.check()} Рад помочь! Обращайтесь, если будут ещё вопросы по турам."
 
-        # Прощания
         elif any(word in query_lower for word in ["пока", "до свидания", "бай", "досвидос"]):
             answer = f"{ce.wave()} До встречи! Обращайтесь, если понадобится помощь с выбором тура!"
 
-        # Кто ты
         elif any(phrase in query_lower for phrase in ["кто ты", "что ты", "ты кто", "представься"]):
             answer = f"Я ИИ-ассистент туристического агентства TFS {ce.world()}. Помогаю подбирать туры и отвечаю на вопросы о наших направлениях. Чем могу помочь?"
 
-        # Общий small talk
         else:
             answer = f"Я здесь, чтобы помочь вам с выбором тура {ce.plane()}. Спросите меня о направлениях, ценах или конкретных турах!"
 

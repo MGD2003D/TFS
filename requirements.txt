@@ -2,16 +2,13 @@ fastapi[standard]
 python-dotenv
 aiohttp
 
---extra-index-url https://download.pytorch.org/whl/cu124
+qdrant-client
+
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
 torchaudio
 
-# transformers
-# accelerate
-# huggingface_hub[hf_xet]
-
-qdrant-client
 sentence-transformers
 pypdf
 python-docx
@@ -19,7 +16,3 @@ python-docx
 minio
 
 aiogram<4.0
-
-ragas
-datasets
-psutil
