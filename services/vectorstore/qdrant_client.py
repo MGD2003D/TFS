@@ -51,16 +51,54 @@ class QdrantVectorStore(BaseVectorStore):
         print(f"Загружаю embedding модель {self.embedding_model_name}")
         print("Это может занять несколько минут при первом запуске (скачивание ~500MB)...")
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.embedding_model = SentenceTransformer(self.embedding_model_name, device=device)
-        print(f"Модель {self.embedding_model_name} успешно загружена на {device.upper()}")
 
-        vector_size = self.embedding_model.get_sentence_embedding_dimension()
+        # Setup cache directory
+        cache_dir = os.getenv('SENTENCE_TRANSFORMERS_HOME') or os.getenv('TRANSFORMERS_CACHE')
+        if cache_dir:
+            print(f"Используется кэш моделей: {cache_dir}")
 
-        if self.enable_hybrid_search:
-            print("Инициализация BM25 Sparse Encoder для Hybrid Search...")
-            self.sparse_encoder = BM25SparseEncoder()
-            self.sparse_vocab_ready = False
-            print("BM25 Sparse Encoder готов")
+        # Check if using BGE-M3 (provides both dense + sparse)
+        self.is_bge_m3 = "bge-m3" in self.embedding_model_name.lower()
+
+        if self.is_bge_m3:
+            # BGE-M3: Single model for dense + sparse
+            from services.bge_m3_encoder import BGEm3Encoder
+            self.bge_encoder = BGEm3Encoder(
+                model_name=self.embedding_model_name,
+                device=device,
+                cache_dir=cache_dir
+            )
+
+            # Compatibility: expose dense encoder as embedding_model
+            # (so existing code using embedding_model.encode() still works)
+            self.embedding_model = self.bge_encoder
+
+            # Override get_sentence_embedding_dimension for compatibility
+            self.embedding_model.get_sentence_embedding_dimension = self.bge_encoder.get_dense_dim
+
+            vector_size = 1024  # BGE-M3 dense dimension
+
+            if self.enable_hybrid_search:
+                # Use BGE-M3 sparse encoder
+                self.sparse_encoder = self.bge_encoder
+                self.sparse_vocab_ready = True  # No vocab building needed
+                print("[BGE-M3] Hybrid search enabled (dense + learned sparse)")
+        else:
+            # Traditional: SentenceTransformer + BM25
+            self.embedding_model = SentenceTransformer(
+                self.embedding_model_name,
+                device=device,
+                cache_folder=cache_dir
+            )
+            print(f"Модель {self.embedding_model_name} успешно загружена на {device.upper()}")
+
+            vector_size = self.embedding_model.get_sentence_embedding_dimension()
+
+            if self.enable_hybrid_search:
+                print("Инициализация BM25 Sparse Encoder для Hybrid Search...")
+                self.sparse_encoder = BM25SparseEncoder()
+                self.sparse_vocab_ready = False
+                print("BM25 Sparse Encoder готов")
 
         collections = self.client.get_collections().collections
         collection_exists = any(col.name == self.collection_name for col in collections)

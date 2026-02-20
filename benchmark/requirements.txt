@@ -1,0 +1,39 @@
+# Core dependencies
+python-dotenv
+aiohttp
+psutil
+
+# PyTorch (CUDA 12.4)
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+torchaudio
+
+# Transformers - КРИТИЧНО: нужна совместимая версия
+transformers>=4.36.0,<4.47.0
+accelerate
+huggingface_hub
+
+# Vector store and embeddings
+qdrant-client
+sentence-transformers
+
+# BGE-M3 hybrid embeddings (dense + sparse)
+FlagEmbedding
+
+# BEIR benchmark datasets
+datasets
+
+# NER (optional, for entity extraction)
+spacy>=3.0.0
+
+# Utilities
+numpy
+tqdm
+
+# Document processing
+pypdf
+python-docx
+
+# Evaluation metrics
+ragas
