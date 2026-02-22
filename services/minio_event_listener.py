@@ -54,12 +54,12 @@ class MinioEventListener:
         print("MinIO Event Listener остановлен")
 
     def _blocking_listen(self):
-        print(f"Начинаю прослушивание событий bucket '{self.minio_storage.bucket_name}'...")
+        print(f"Начинаю прослушивание событий bucket '{self.minio_storage.corporate_bucket}'...")
 
         while not self.should_stop:
             try:
                 events = self.minio_storage.client.listen_bucket_notification(
-                    bucket_name=self.minio_storage.bucket_name,
+                    bucket_name=self.minio_storage.corporate_bucket,
                     prefix="",
                     suffix="",
                     events=[
@@ -111,7 +111,7 @@ class MinioEventListener:
                 object_info = s3_info.get('object', {})
                 object_name = object_info.get('key', '')
 
-                if bucket_name != self.minio_storage.bucket_name:
+                if bucket_name != self.minio_storage.corporate_bucket:
                     continue
 
                 parts = object_name.split('/', 1)
@@ -145,7 +145,7 @@ class MinioEventListener:
         try:
             try:
                 response = self.minio_storage.client.get_object(
-                    self.minio_storage.bucket_name,
+                    self.minio_storage.corporate_bucket,
                     object_name
                 )
                 content = response.read()
@@ -171,16 +171,31 @@ class MinioEventListener:
                     temp_file.name,
                     document_id=content_hash
                 )
-                await app_state.vector_store.add_documents(chunks, metadata)
+                for meta in metadata:
+                    meta["namespace"] = "corporate"
+                await app_state.vector_store.add_documents(chunks, metadata, namespace="corporate")
+                print(f"Документ {filename} успешно проиндексирован (content hash: {content_hash}, {len(chunks)} чанков, namespace: corporate)")
 
-                print(f"Документ {filename} успешно проиндексирован (content hash: {content_hash}, {len(chunks)} чанков)")
+            except Exception as idx_err:
+                import traceback
+                print(f"[ERROR] Не удалось проиндексировать '{filename}': {idx_err}")
+                traceback.print_exc()
+                print(f"[ROLLBACK] Удаляем '{filename}' из MinIO...")
+                try:
+                    await self.minio_storage.delete_document(
+                        content_hash, filename,
+                        bucket_name=self.minio_storage.corporate_bucket
+                    )
+                    print(f"[ROLLBACK] '{filename}' удалён из MinIO")
+                except Exception as del_e:
+                    print(f"[ROLLBACK] Не удалось удалить '{filename}' из MinIO: {del_e}")
 
             finally:
                 if os.path.exists(temp_file.name):
                     os.unlink(temp_file.name)
 
         except Exception as e:
-            print(f"Ошибка при индексации документа {filename}: {e}")
+            print(f"Ошибка при обработке документа {filename}: {e}")
             import traceback
             traceback.print_exc()
 

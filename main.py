@@ -9,7 +9,6 @@ from services.minio_event_listener import MinioEventListener
 from services.startup_sync import sync_on_startup
 from services.chat_cleanup import ChatCleanupWorker
 from services.query_enhancer import QueryEnhancerService
-from services.tour_catalog import TourCatalogService
 import app_state
 import os
 import asyncio
@@ -77,16 +76,6 @@ async def lifespan(app: FastAPI):
     print("\n6/8 Синхронизация MinIO -> Qdrant...")
     await sync_on_startup(minio_storage, vector_store, document_indexer)
     print("Синхронизация завершена")
-
-    print("\n6.5/8 Построение каталога туров...")
-    generate_tour_descriptions = os.getenv('GENERATE_TOUR_DESCRIPTIONS', 'false').lower() == 'true'
-    tour_catalog = TourCatalogService(generate_descriptions=generate_tour_descriptions)
-    app_state.tour_catalog = tour_catalog
-    await tour_catalog.build_catalog(minio_storage, vector_store)
-    if generate_tour_descriptions:
-        print("Каталог туров готов (с описаниями через LLM)")
-    else:
-        print("Каталог туров готов (без описаний)")
 
     print("\n7/8 Запуск MinIO Event Listener...")
     minio_event_listener = MinioEventListener(minio_storage)

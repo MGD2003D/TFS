@@ -6,7 +6,24 @@ from .base import BaseVectorStore
 from services.sparse_encoder import BM25SparseEncoder
 import uuid
 import os
+import time
 import torch
+import numpy as np
+
+
+def _is_model_cached(model_name: str, cache_dir: str) -> bool:
+    """Check if a HuggingFace model is already present in the local cache.
+
+    HF Hub stores models as: {cache_dir}/models--{org}--{model}/snapshots/{hash}/
+    Sentence-transformers also respects this format when cache_folder is set.
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return False
+    # HF Hub format: replace '/' with '--' and prefix 'models--'
+    model_slug = "models--" + model_name.replace("/", "--")
+    model_dir = os.path.join(cache_dir, model_slug)
+    snapshots_dir = os.path.join(model_dir, "snapshots")
+    return os.path.isdir(snapshots_dir) and bool(os.listdir(snapshots_dir))
 
 
 class QdrantVectorStore(BaseVectorStore):
@@ -48,19 +65,62 @@ class QdrantVectorStore(BaseVectorStore):
             if old_https_proxy:
                 os.environ['HTTPS_PROXY'] = old_https_proxy
 
-        print(f"Загружаю embedding модель {self.embedding_model_name}")
-        print("Это может занять несколько минут при первом запуске (скачивание ~500MB)...")
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.embedding_model = SentenceTransformer(self.embedding_model_name, device=device)
-        print(f"Модель {self.embedding_model_name} успешно загружена на {device.upper()}")
 
-        vector_size = self.embedding_model.get_sentence_embedding_dimension()
+        # Setup cache directory
+        cache_dir = os.getenv('SENTENCE_TRANSFORMERS_HOME') or os.getenv('TRANSFORMERS_CACHE')
 
-        if self.enable_hybrid_search:
-            print("Инициализация BM25 Sparse Encoder для Hybrid Search...")
-            self.sparse_encoder = BM25SparseEncoder()
-            self.sparse_vocab_ready = False
-            print("BM25 Sparse Encoder готов")
+        # Check if using BGE-M3 (provides both dense + sparse)
+        self.is_bge_m3 = "bge-m3" in self.embedding_model_name.lower()
+
+        if self.is_bge_m3:
+            # BGE-M3: Single model for dense + sparse
+            from services.bge_m3_encoder import BGEm3Encoder
+            self.bge_encoder = BGEm3Encoder(
+                model_name=self.embedding_model_name,
+                device=device,
+                cache_dir=cache_dir
+            )
+
+            # Compatibility: expose dense encoder as embedding_model
+            # (so existing code using embedding_model.encode() still works)
+            self.embedding_model = self.bge_encoder
+
+            # Override get_sentence_embedding_dimension for compatibility
+            self.embedding_model.get_sentence_embedding_dimension = self.bge_encoder.get_dense_dim
+
+            vector_size = 1024  # BGE-M3 dense dimension
+
+            if self.enable_hybrid_search:
+                # Use BGE-M3 sparse encoder
+                self.sparse_encoder = self.bge_encoder
+                self.sparse_vocab_ready = True  # No vocab building needed
+                print("[BGE-M3] Hybrid search enabled (dense + learned sparse)")
+        else:
+            # Traditional: SentenceTransformer + BM25
+            is_cached = _is_model_cached(self.embedding_model_name, cache_dir)
+            if is_cached:
+                print(f"Загружаю embedding модель {self.embedding_model_name} из кэша ({cache_dir})...")
+            else:
+                print(f"Скачиваю embedding модель {self.embedding_model_name} (~500MB), кэш: {cache_dir or 'по умолчанию'}")
+                print("Прогресс скачивания отображается ниже:")
+
+            t0 = time.time()
+            self.embedding_model = SentenceTransformer(
+                self.embedding_model_name,
+                device=device,
+                cache_folder=cache_dir
+            )
+            elapsed = time.time() - t0
+            print(f"Модель {self.embedding_model_name} загружена на {device.upper()} за {elapsed:.1f}s")
+
+            vector_size = self.embedding_model.get_sentence_embedding_dimension()
+
+            if self.enable_hybrid_search:
+                print("Инициализация BM25 Sparse Encoder для Hybrid Search...")
+                self.sparse_encoder = BM25SparseEncoder()
+                self.sparse_vocab_ready = False
+                print("BM25 Sparse Encoder готов")
 
         collections = self.client.get_collections().collections
         collection_exists = any(col.name == self.collection_name for col in collections)
@@ -158,7 +218,30 @@ class QdrantVectorStore(BaseVectorStore):
             self.sparse_vocab_ready = True
 
         prefixed_texts = [f"passage: {text}" for text in texts] if self._use_prefixes() else texts
-        embeddings = self.embedding_model.encode(prefixed_texts, show_progress_bar=True, normalize_embeddings=True)
+        batch_size = 32
+        total = len(prefixed_texts)
+        total_batches = (total + batch_size - 1) // batch_size
+        embed_step = max(1, total_batches // 10)
+        t_embed = time.time()
+        print(f"[EMBED] Векторизация {total} чанков ({total_batches} батчей по {batch_size})...", flush=True)
+        all_embeddings = []
+        for batch_idx, start in enumerate(range(0, total, batch_size)):
+            batch = prefixed_texts[start:start + batch_size]
+            batch_emb = self.embedding_model.encode(batch, show_progress_bar=False, normalize_embeddings=True)
+            all_embeddings.append(batch_emb)
+            done = min(start + batch_size, total)
+            if (batch_idx + 1) % embed_step == 0 or done == total:
+                pct = done * 100 // total
+                filled = pct // 5
+                bar = "█" * filled + "░" * (20 - filled)
+                print(f"  [EMBED] [{bar}] {pct:3d}% ({done}/{total})  {time.time() - t_embed:.1f}s", flush=True)
+        embeddings = np.vstack(all_embeddings)
+        print(f"[EMBED] Готово за {time.time() - t_embed:.1f}s", flush=True)
+
+        if self.enable_hybrid_search and self.sparse_encoder:
+            print(f"[SPARSE] Кодирование {len(texts)} чанков...", flush=True)
+        t_sparse = time.time()
+        sparse_step = max(1, min(50, len(texts) // 10))
 
         points = []
         for idx, (text, embedding) in enumerate(zip(texts, embeddings)):
@@ -170,6 +253,12 @@ class QdrantVectorStore(BaseVectorStore):
 
             if self.enable_hybrid_search and self.sparse_encoder:
                 sparse_vector = self.sparse_encoder.encode(text)
+
+                if (idx + 1) % sparse_step == 0 or idx + 1 == len(texts):
+                    pct = (idx + 1) * 100 // len(texts)
+                    filled = pct // 5
+                    bar = "█" * filled + "░" * (20 - filled)
+                    print(f"  [SPARSE] [{bar}] {pct:3d}% ({idx+1}/{len(texts)})  {time.time() - t_sparse:.1f}s", flush=True)
 
                 points.append(
                     PointStruct(
@@ -193,10 +282,16 @@ class QdrantVectorStore(BaseVectorStore):
                     )
                 )
 
+        if self.enable_hybrid_search and self.sparse_encoder:
+            print(f"[SPARSE] Готово за {time.time() - t_sparse:.1f}s", flush=True)
+
+        print(f"[QDRANT] Загрузка {len(points)} точек в коллекцию...", flush=True)
+        t_upsert = time.time()
         self.client.upsert(
             collection_name=self.collection_name,
             points=points
         )
+        print(f"[QDRANT] Upsert завершён за {time.time() - t_upsert:.1f}s", flush=True)
 
         if self.enable_hybrid_search:
             print(f"Добавлено {len(points)} чанков в {self.collection_name} (hybrid: dense + sparse) [namespace: {point_metadata.get('namespace', namespace)}]")
@@ -531,14 +626,22 @@ class QdrantVectorStore(BaseVectorStore):
         )
 
         documents = {}
+        chunk_counts: Dict[str, int] = {}
         for point in scroll_result[0]:
             doc_id = point.payload.get("document_id")
-            if doc_id and doc_id not in documents:
+            if not doc_id:
+                continue
+            if doc_id not in documents:
                 documents[doc_id] = {
                     "document_id": doc_id,
                     "source": point.payload.get("source", "unknown"),
-                    "total_chunks": point.payload.get("total_chunks", 0)
+                    "total_chunks": point.payload.get("total_chunks", 0),
                 }
+                chunk_counts[doc_id] = 0
+            chunk_counts[doc_id] += 1
+
+        for doc_id, doc in documents.items():
+            doc["indexed_chunks"] = chunk_counts[doc_id]
 
         return list(documents.values())
 

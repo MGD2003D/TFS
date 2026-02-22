@@ -2,7 +2,20 @@ from pypdf import PdfReader
 from docx import Document
 from typing import List, Dict, Any
 import os
+import time
 from services.document_types import normalize_extension
+from services.ner_service import extract_entities
+
+
+def _ner_progress(idx: int, total: int, t0: float) -> None:
+    """Print NER progress every 10% or every 50 chunks (whichever fires first)."""
+    step = max(1, min(50, total // 10))
+    if (idx + 1) % step == 0 or idx + 1 == total:
+        elapsed = time.time() - t0
+        pct = (idx + 1) * 100 // total
+        filled = pct // 5
+        bar = "█" * filled + "░" * (20 - filled)
+        print(f"  [NER] [{bar}] {pct:3d}% ({idx+1}/{total})  {elapsed:.1f}s elapsed", flush=True)
 
 
 class DocumentIndexer:
@@ -74,16 +87,23 @@ class DocumentIndexer:
 
         source_name = original_filename if original_filename else os.path.basename(pdf_path)
 
+        print(f"Извлечено {len(chunks)} чанков из {pdf_path}")
+        print(f"[NER] Начинаю обработку {len(chunks)} чанков...", flush=True)
+        t0 = time.time()
         metadata = []
         for idx, chunk in enumerate(chunks):
+            ner = extract_entities(chunk)
             metadata.append({
                 "document_id": document_id,
                 "source": source_name,
                 "chunk_id": idx,
-                "total_chunks": len(chunks)
+                "total_chunks": len(chunks),
+                "entity_texts": ner["entity_texts"],
+                "entity_labels": ner["entity_labels"],
             })
+            _ner_progress(idx, len(chunks), t0)
 
-        print(f"Извлечено {len(chunks)} чанков из {pdf_path}")
+        print(f"[NER] Готово за {time.time() - t0:.1f}s", flush=True)
         return chunks, metadata
 
     async def process_docx(self, docx_path: str, document_id: str = None, original_filename: str = None) -> tuple[List[str], List[Dict[str, Any]]]:
@@ -99,16 +119,23 @@ class DocumentIndexer:
 
         source_name = original_filename if original_filename else os.path.basename(docx_path)
 
+        print(f"Extracted {len(chunks)} chunks from {docx_path}")
+        print(f"[NER] Начинаю обработку {len(chunks)} чанков...", flush=True)
+        t0 = time.time()
         metadata = []
         for idx, chunk in enumerate(chunks):
+            ner = extract_entities(chunk)
             metadata.append({
                 "document_id": document_id,
                 "source": source_name,
                 "chunk_id": idx,
-                "total_chunks": len(chunks)
+                "total_chunks": len(chunks),
+                "entity_texts": ner["entity_texts"],
+                "entity_labels": ner["entity_labels"],
             })
+            _ner_progress(idx, len(chunks), t0)
 
-        print(f"Extracted {len(chunks)} chunks from {docx_path}")
+        print(f"[NER] Готово за {time.time() - t0:.1f}s", flush=True)
         return chunks, metadata
 
     async def process_document(self, file_path: str, document_id: str = None, original_filename: str = None) -> tuple[List[str], List[Dict[str, Any]]]:

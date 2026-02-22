@@ -1,3 +1,4 @@
+import asyncio
 import app_state
 import prompts_config
 from typing import List, Dict, Tuple
@@ -7,15 +8,18 @@ import os
 import io
 import time
 from services.document_types import is_supported_document, temp_suffix_for
+from services.fusion_strategies import weighted_rrf_fusion
+from services.ner_service import boost_results_by_entities
 from tg_bot import custom_emoji as ce
 
 
 class RAGService:
 
-    def __init__(self, min_relevance: float = 0.35, default_top_k: int = 8, enable_query_enhancement: bool = True):
+    def __init__(self, min_relevance: float = 0.35, default_top_k: int = 8, enable_query_enhancement: bool = True, enable_decomposition: bool = True):
         self.min_relevance = min_relevance
         self.default_top_k = default_top_k
         self.enable_query_enhancement = enable_query_enhancement
+        self.enable_decomposition = enable_decomposition
 
     def _resolve_namespace(self, user_id: str, is_corporate: bool) -> str:
 
@@ -95,6 +99,20 @@ class RAGService:
                 "is_corporate": is_corporate,
                 "uploaded_at": minio_result["uploaded_at"]
             }
+
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] Не удалось проиндексировать '{file.filename}': {e}")
+            traceback.print_exc()
+            print(f"[ROLLBACK] Удаляем '{file.filename}' из MinIO (bucket: {minio_result['bucket_name']})...")
+            try:
+                await app_state.minio_storage.delete_document(
+                    document_id, file.filename, bucket_name=minio_result["bucket_name"]
+                )
+                print(f"[ROLLBACK] '{file.filename}' удалён из MinIO")
+            except Exception as del_e:
+                print(f"[ROLLBACK] Не удалось удалить '{file.filename}' из MinIO: {del_e}")
+            raise RuntimeError(f"Ошибка индексации документа '{file.filename}': {e}") from e
 
         finally:
             if os.path.exists(temp_file.name):
@@ -224,13 +242,14 @@ class RAGService:
             top_k = self.default_top_k
 
         enhancement_time = 0.0
-        intent = "tour_info"
+        intent = "general"
+        enhanced = {}
 
         if self.enable_query_enhancement:
             enhancement_start = time.perf_counter()
             enhanced = await app_state.query_enhancer.enhance_query(query)
             enhancement_time = time.perf_counter() - enhancement_start
-            intent = enhanced.get("intent", "tour_info")
+            intent = enhanced.get("intent", "general")
 
             print(f"\n{'='*80}")
             print(f"[QUERY ENHANCEMENT]")
@@ -255,41 +274,6 @@ class RAGService:
             if intent == "off_topic":
                 return await self._handle_off_topic(user_id, query, enhancement_time, total_start)
 
-            if intent == "list_tours":
-                return await self._handle_list_tours_intent(
-                    user_id=user_id,
-                    query=query,
-                    enhanced=enhanced,
-                    enhancement_time=enhancement_time,
-                    total_start=total_start
-                )
-
-            if intent == "filtered_list":
-                entities = enhanced.get('entities', {})
-                destinations = entities.get('destinations', [])
-                tour_types = entities.get('tour_types', [])
-
-                if destinations or tour_types:
-                    tours = app_state.tour_catalog.filter_tours(
-                        destinations=destinations,
-                        tour_types=tour_types
-                    )
-
-                    if len(tours) > 6:
-                        print(f"[FILTERED LIST] Found {len(tours)} tours - showing compact list")
-                        return await self._handle_list_tours_intent(
-                            user_id=user_id,
-                            query=query,
-                            enhanced=enhanced,
-                            enhancement_time=enhancement_time,
-                            total_start=total_start
-                        )
-                    else:
-                        print(f"[FILTERED LIST] Found {len(tours)} tours - using RAG with full details")
-                else:
-                    print(f"[FILTERED LIST] No filters found - using RAG")
-
-
             search_queries = app_state.query_enhancer.build_search_queries(enhanced)
         else:
             search_queries = [query]
@@ -297,57 +281,96 @@ class RAGService:
         namespaces = self._resolve_namespaces(user_id, scope)
 
         search_start = time.perf_counter()
-        all_results = []
-        seen_texts = set()
 
-        for idx, search_query in enumerate(search_queries, 1):
-            if len(search_queries) > 1:
-                print(f"[MULTI-QUERY SEARCH] Query {idx}/{len(search_queries)}: {search_query}")
-            results = await app_state.vector_store.search(
-                search_query,
+        # Adaptive decomposition: LLM classifies query complexity → selects strategy
+        aspects = None
+        if self.enable_decomposition and self.enable_query_enhancement:
+            aspects = await app_state.query_enhancer.decompose_query(query)
+
+        if aspects and len(aspects) >= 2:
+            # DECOMPOSITION: parallel search per aspect + weighted RRF × coverage
+            print(f"[ADAPTIVE] Strategy: decomposition ({len(aspects)} aspects)")
+            aspect_queries = list(aspects.values())  # "original" is always first
+            tasks = [
+                app_state.vector_store.search(q, top_k=20, namespaces=namespaces)
+                for q in aspect_queries
+            ]
+            results_per_aspect = await asyncio.gather(*tasks)
+
+            # Build metadata lookup: chunk text → full result dict (for recovering metadata after fusion)
+            doc_metadata_lookup = {}
+            for results in results_per_aspect:
+                for r in results:
+                    chunk_key = r.get("text", "")[:100]
+                    if chunk_key and chunk_key not in doc_metadata_lookup:
+                        doc_metadata_lookup[chunk_key] = r
+
+            hits = weighted_rrf_fusion(
+                list(results_per_aspect),
                 top_k=top_k,
-                namespaces=namespaces
+                original_weight=3.0,
+                aspect_weight=1.0,
             )
 
-            for result in results:
-                text_key = result['text'][:100]
-                if text_key not in seen_texts:
-                    seen_texts.add(text_key)
-                    result['search_query'] = search_query
-                    all_results.append(result)
+            search_results = []
+            for hit in hits:
+                if hit.doc_id in doc_metadata_lookup:
+                    search_results.append({**doc_metadata_lookup[hit.doc_id], "score": hit.score})
+        else:
+            # BASELINE: existing multi-query search with deduplication
+            if aspects is not None:
+                print(f"[ADAPTIVE] Strategy: baseline (simple query)")
+            all_results = []
+            seen_texts = set()
 
-        search_results = sorted(all_results, key=lambda x: x['score'], reverse=True)[:top_k]
+            for idx, search_query in enumerate(search_queries, 1):
+                print(f"\n[SEARCH] Query {idx}/{len(search_queries)}: '{search_query}'")
+                results = await app_state.vector_store.search(
+                    search_query,
+                    top_k=top_k,
+                    namespaces=namespaces
+                )
+                print(f"[SEARCH] → {len(results)} raw results:")
+                for r in results:
+                    print(f"    score={r.get('score', 0):.4f}  src={r.get('metadata', {}).get('source', '?')}  chunk={r.get('metadata', {}).get('chunk_id', '?')}")
+
+                new_added = 0
+                for result in results:
+                    text_key = result['text'][:100]
+                    if text_key not in seen_texts:
+                        seen_texts.add(text_key)
+                        result['search_query'] = search_query
+                        all_results.append(result)
+                        new_added += 1
+                print(f"[SEARCH] → {new_added} new unique chunks added (total so far: {len(all_results)})")
+
+            search_results = sorted(all_results, key=lambda x: x['score'], reverse=True)[:top_k]
+
         search_time = time.perf_counter() - search_start
 
         print(f"\n{'='*80}")
         print(f"[RAG CHAT] User ID: {user_id}")
         print(f"[RAG CHAT] Original Query: {query}")
+        print(f"[RAG CHAT] Namespaces: {namespaces}")
+        print(f"[RAG CHAT] top_k={top_k}  min_relevance={self.min_relevance}")
         print(f"[RAG CHAT] Query Enhancement: {'ENABLED' if self.enable_query_enhancement else 'DISABLED'}")
-        if self.enable_query_enhancement:
-            print(f"[RAG CHAT] Searched {len(search_queries)} query variations")
         print(f"[RAG CHAT] Found {len(search_results)} unique results (after deduplication)")
 
-        if search_results and 'search_type' in search_results[0]:
-            search_type_stats = {}
-            for doc in search_results:
-                stype = doc.get('search_type', 'unknown')
-                search_type_stats[stype] = search_type_stats.get(stype, 0) + 1
-            print(f"[RAG CHAT] Search types: {search_type_stats}")
-
         if search_results:
-            for i, doc in enumerate(search_results[:5], 1):
-                print(f"\n--- Result {i} ---")
-                print(f"  Score: {doc.get('score', 0):.4f}")
-
-                if 'dense_score' in doc and 'sparse_score' in doc:
-                    print(f"    Dense: {doc.get('dense_score', 0):.4f} | Sparse: {doc.get('sparse_score', 0):.4f} | Combined: {doc.get('combined_score', 0):.4f}")
-                    print(f"  Search type: {doc.get('search_type', 'N/A')}")
-
-                print(f"  Source: {doc.get('metadata', {}).get('source', 'unknown')}")
-                print(f"  Chunk ID: {doc.get('metadata', {}).get('chunk_id', 'N/A')}")
-                if self.enable_query_enhancement:
-                    print(f"  Found by query: {doc.get('search_query', 'N/A')}")
-                print(f"  Text preview: {doc.get('text', '')[:150]}...")
+            print(f"\n[RAG CHAT] ALL results (sorted by score):")
+            for i, doc in enumerate(search_results, 1):
+                score = doc.get('score', 0)
+                above = "✓" if score >= self.min_relevance else "✗"
+                src = doc.get('metadata', {}).get('source', 'unknown')
+                chunk_id = doc.get('metadata', {}).get('chunk_id', 'N/A')
+                sq = doc.get('search_query', 'N/A')
+                dense = doc.get('dense_score')
+                sparse = doc.get('sparse_score')
+                score_detail = f"  [dense={dense:.4f} sparse={sparse:.4f}]" if dense is not None and sparse is not None else ""
+                print(f"  {above} [{i}] score={score:.4f}{score_detail}  src={src}  chunk={chunk_id}  query='{sq}'")
+                print(f"       text: {doc.get('text', '')[:120].replace(chr(10), ' ')}...")
+        else:
+            print(f"[RAG CHAT] ⚠ NO results returned from vector store!")
         print(f"{'='*80}\n")
 
         if not search_results:
@@ -367,11 +390,28 @@ class RAGService:
             )
             return {"answer": answer, "sources": []}
 
+        # Entity boosting: rerank using NER overlap between query and chunk entities
+        query_entities = enhanced.get("entities", {}).get("named_entities", [])
+        if query_entities and search_results:
+            search_results = boost_results_by_entities(search_results, query_entities, boost_weight=0.3)
+            print(f"[ENTITY BOOST] Applied boost using {len(query_entities)} query entities: {query_entities}")
+
+        # Normalize scores to [0, 1] so min_relevance threshold is meaningful
+        # regardless of whether scores come from cosine similarity or RRF
+        if search_results:
+            max_score = max(r['score'] for r in search_results)
+            if max_score > 0:
+                for r in search_results:
+                    r['score'] = round(r['score'] / max_score, 4)
+
         filter_start = time.perf_counter()
         relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
         filter_time = time.perf_counter() - filter_start
 
-        print(f"[RAG CHAT] Filtered: {len(relevant_results)}/{len(search_results)} results above threshold {self.min_relevance}")
+        print(f"[RAG CHAT] Filter threshold={self.min_relevance}: {len(relevant_results)}/{len(search_results)} passed")
+        if search_results and not relevant_results:
+            best = search_results[0].get('score', 0)
+            print(f"[RAG CHAT] ⚠ ALL results below threshold! Best score={best:.4f}, need >={self.min_relevance}")
 
         context_time = 0.0
         if relevant_results:
@@ -549,22 +589,22 @@ class RAGService:
         query_lower = query.lower()
 
         if any(word in query_lower for word in ["привет", "здравствуй", "добрый день", "добрый вечер", "доброе утро", "хай", "хэй"]):
-            answer = f"{ce.wave()} Привет! Я помогу вам подобрать тур {ce.plane()}. Спросите меня о наших направлениях или конкретных турах!"
+            answer = f"{ce.wave()} Привет! Задайте вопрос — я отвечу на основе документов из базы знаний."
 
         elif any(phrase in query_lower for phrase in ["как дела", "как ты", "как поживаешь", "что нового"]):
-            answer = f"Всё отлично, спасибо! {ce.sparkles()} Готов помочь вам с подбором тура. Какое направление вас интересует?"
+            answer = f"Всё отлично, спасибо! {ce.sparkles()} Готов помочь. Задайте ваш вопрос."
 
         elif any(word in query_lower for word in ["спасибо", "благодарю", "thanks", "пасиб"]):
-            answer = f"{ce.check()} Рад помочь! Обращайтесь, если будут ещё вопросы по турам."
+            answer = f"{ce.check()} Рад помочь! Обращайтесь, если будут ещё вопросы."
 
         elif any(word in query_lower for word in ["пока", "до свидания", "бай", "досвидос"]):
-            answer = f"{ce.wave()} До встречи! Обращайтесь, если понадобится помощь с выбором тура!"
+            answer = f"{ce.wave()} До встречи! Обращайтесь, если понадобится помощь."
 
         elif any(phrase in query_lower for phrase in ["кто ты", "что ты", "ты кто", "представься"]):
-            answer = f"Я ИИ-ассистент туристического агентства TFS {ce.world()}. Помогаю подбирать туры и отвечаю на вопросы о наших направлениях. Чем могу помочь?"
+            answer = f"Я ИИ-ассистент {ce.world()}. Отвечаю на вопросы по документам из базы знаний. Чем могу помочь?"
 
         else:
-            answer = f"Я здесь, чтобы помочь вам с выбором тура {ce.plane()}. Спросите меня о направлениях, ценах или конкретных турах!"
+            answer = f"Я здесь, чтобы помочь! {ce.sparkles()} Задайте вопрос по документам."
 
         app_state.add_role_message(user_id, query, role="user")
         app_state.add_role_message(user_id, answer, role="assistant")
@@ -580,7 +620,7 @@ class RAGService:
         """
         print(f"[INAPPROPRIATE] User {user_id} sent inappropriate message")
 
-        answer = "Пожалуйста, общайтесь вежливо. Я здесь, чтобы помочь вам с подбором тура. Чем могу помочь?"
+        answer = "Пожалуйста, общайтесь вежливо. Чем могу помочь?"
 
         app_state.add_role_message(user_id, query, role="user")
         app_state.add_role_message(user_id, answer, role="assistant")
@@ -596,7 +636,7 @@ class RAGService:
         """
         print(f"[OFF TOPIC] User {user_id}: {query}")
 
-        answer = "Извините, я специализируюсь только на туристических вопросах. Могу рассказать про туры, направления, цены и условия. Чем могу помочь?"
+        answer = "Извините, этот вопрос выходит за рамки базы знаний. Задайте вопрос по документам."
 
         app_state.add_role_message(user_id, query, role="user")
         app_state.add_role_message(user_id, answer, role="assistant")
@@ -606,120 +646,3 @@ class RAGService:
 
         return {"answer": answer, "sources": []}
 
-    async def _handle_list_tours_intent(
-        self,
-        user_id: str,
-        query: str,
-        enhanced: Dict = None,
-        enhancement_time: float = 0.0,
-        total_start: float = None
-    ) -> Dict:
-
-        if total_start is None:
-            total_start = time.perf_counter()
-
-        destinations = []
-        tour_types = []
-        is_filtered = False
-
-        if enhanced and enhanced.get('entities'):
-            entities = enhanced['entities']
-            destinations = entities.get('destinations', [])
-            tour_types = entities.get('tour_types', [])
-            is_filtered = bool(destinations or tour_types)
-
-        intent = enhanced.get('intent', 'list_tours') if enhanced else 'list_tours'
-
-        if is_filtered:
-            print(f"[FILTERED LIST TOURS] User {user_id} requested filtered catalog")
-            print(f"  Destinations: {destinations}")
-            print(f"  Tour Types: {tour_types}")
-        else:
-            print(f"[LIST TOURS] User {user_id} requested full tours catalog")
-
-        if not app_state.tour_catalog or not app_state.tour_catalog.initialized:
-            answer = "⏳ Каталог туров еще загружается, пожалуйста подождите немного..."
-            app_state.add_role_message(user_id, query, role="user")
-            app_state.add_role_message(user_id, answer, role="assistant")
-
-            total_time = time.perf_counter() - total_start
-            print(f"[timing] list_tours: total={total_time:.3f}s (catalog_not_ready)")
-            return {"answer": answer, "sources": []}
-
-        if is_filtered:
-            tours = app_state.tour_catalog.filter_tours(
-                destinations=destinations,
-                tour_types=tour_types
-            )
-        else:
-            tours = app_state.tour_catalog.get_all_tours()
-
-        if not tours:
-            if is_filtered:
-                filter_desc = []
-                if destinations:
-                    filter_desc.append(f"направлениям: {', '.join(destinations)}")
-                if tour_types:
-                    filter_desc.append(f"типам: {', '.join(tour_types)}")
-                filters_str = " и ".join(filter_desc)
-                answer = f"К сожалению, я не нашел туров по {filters_str}. Попробуйте изменить критерии поиска или спросите про все доступные туры."
-            else:
-                answer = "К сожалению, в данный момент в каталоге нет доступных туров."
-
-            app_state.add_role_message(user_id, query, role="user")
-            app_state.add_role_message(user_id, answer, role="assistant")
-
-            total_time = time.perf_counter() - total_start
-            print(f"[timing] list_tours: enhancement={enhancement_time:.3f}s total={total_time:.3f}s (no_tours)")
-            return {"answer": answer, "sources": []}
-
-        has_descriptions = any(tour.get('description') for tour in tours)
-
-        tours_list_lines = []
-        for idx, tour in enumerate(tours, 1):
-            tour_name = tour.get('tour_name', 'Неизвестный тур')
-            description = tour.get('description')
-
-            if has_descriptions and description:
-                tours_list_lines.append(f"{idx}. **{tour_name}**")
-                tours_list_lines.append(f"   {description}")
-                tours_list_lines.append("")
-            else:
-                tours_list_lines.append(f"{idx}. {tour_name}")
-
-        tours_list = "\n".join(tours_list_lines)
-
-        if is_filtered:
-            filter_desc = []
-            if destinations:
-                filter_desc.append(', '.join(destinations))
-            if tour_types:
-                filter_desc.append(', '.join(tour_types))
-            filters_str = ' - '.join(filter_desc)
-
-            if len(tours) > 6:
-                answer = f"""{ce.memo()} Найдено {len(tours)} туров по запросу "{filters_str}":
-
-{tours_list}
-
-Я не могу рассказать обо всех турах в одном сообщении, но вы можете спросить меня о любом из них подробнее! {ce.sparkles()}"""
-            else:
-                answer = f"""{ce.memo()} Найдено {len(tours)} {'тур' if len(tours) == 1 else 'туров'} по запросу "{filters_str}":
-
-{tours_list}
-
-{ce.sparkles()} Спросите меня о любом из туров, и я расскажу подробности!"""
-        else:
-            answer = f"""{ce.memo()} У нас есть {len(tours)} туров в каталоге:
-
-{tours_list}
-
-{ce.sparkles()} Спросите меня о любом из туров, и я расскажу подробности!"""
-
-        app_state.add_role_message(user_id, query, role="user")
-        app_state.add_role_message(user_id, answer, role="assistant")
-
-        total_time = time.perf_counter() - total_start
-        print(f"[timing] list_tours: enhancement={enhancement_time:.3f}s total={total_time:.3f}s (found {len(tours)} tours)")
-
-        return {"answer": answer, "sources": []}

@@ -8,7 +8,6 @@ vector_store = None
 document_indexer = None
 minio_storage = None
 query_enhancer = None
-tour_catalog = None
 
 services_ready = False
 

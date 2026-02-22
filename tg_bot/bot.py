@@ -81,44 +81,16 @@ async def cmd_start(message: types.Message):
     chat_service.clear_chat_history(tg_id)
 
     await message.answer(
-        "👋 Привет! Я ИИ-ассистент TFS!\n\n"
+        "👋 Привет! Я ИИ-ассистент!\n\n"
         "📚 Команды:\n"
-        "/tours - показать все туры\n"
         "/search_mode - режим поиска (personal/corporate/personal_corporate)\n"
         "/upload_mode - режим загрузки документов (personal/corporate)\n"
         "/start - начать сначала\n\n"
         "💡 Вы можете:\n"
-        "• Задавать вопросы о турах\n"
+        "• Задавать вопросы по документам\n"
         "• Загружать документы (.pdf, .docx)\n"
         "• Переключать хранилища для поиска"
     )
-
-@dp.message(Command("tours"))
-async def cmd_tours(message: types.Message):
-    if not app_state.services_ready or not rag_service:
-        await message.answer("⏳ Сервисы еще загружаются, пожалуйста подождите...")
-        return
-
-    import time
-    tg_id = message.from_user.id
-    start_time = time.perf_counter()
-
-    typing_task = asyncio.create_task(_typing_indicator(message.chat.id))
-    try:
-        result = await rag_service._handle_list_tours_intent(
-            user_id=str(tg_id),
-            query="Покажи все туры",
-            enhancement_time=0.0,
-            total_start=start_time
-        )
-    finally:
-        typing_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await typing_task
-
-    formatted_answer = format_telegram_message(result["answer"])
-    await message.answer(formatted_answer, parse_mode=ParseMode.HTML)
-
 
 @dp.message(Command("search_mode"))
 async def cmd_search_mode(message: types.Message):

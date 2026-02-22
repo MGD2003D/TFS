@@ -2,6 +2,7 @@ import app_state
 import prompts_config
 from typing import Dict, List, Optional
 import json
+import re
 import time
 
 
@@ -10,19 +11,13 @@ class QueryEnhancerService:
     Сервис для улучшения поисковых запросов через LLM.
 
     Функции:
-    - Извлечение сущностей (страны, города, типы туров, даты, бюджет)
+    - Извлечение ключевых сущностей и терминов
     - Переформулирование запроса в поисковый вид
-    - Добавление доменных терминов туризма
     - Генерация альтернативных вариантов запроса
     """
 
     def __init__(self):
-        self.tourism_domains = [
-            "тур", "путешествие", "отдых", "поездка", "экскурсия",
-            "пляж", "море", "горы", "страна", "город", "отель",
-            "виза", "страховка", "трансфер", "перелет", "багаж",
-            "питание", "проживание", "маршрут", "гид", "группа"
-        ]
+        pass
 
     async def enhance_query(self, original_query: str) -> Dict:
         """
@@ -31,16 +26,14 @@ class QueryEnhancerService:
         Returns:
             {
                 "original_query": str,
-                "intent": str,  # list_tours, tour_info, general_question
-                "rewritten_query": str,  # основной переформулированный запрос
-                "alternative_queries": List[str],  # альтернативные варианты
+                "intent": str,  # factual, definition, comparison, process, general
+                "rewritten_query": str,
+                "alternative_queries": List[str],
                 "entities": {
-                    "destinations": List[str],  # страны/города
-                    "tour_types": List[str],  # типы туров
-                    "dates": List[str],  # даты/периоды
-                    "budget": Optional[str],  # бюджет
-                    "duration": Optional[str],  # длительность
-                    "other": Dict  # прочие сущности
+                    "key_terms": List[str],
+                    "named_entities": List[str],
+                    "temporal": List[str],
+                    "numerical": List[str]
                 }
             }
         """
@@ -77,7 +70,7 @@ class QueryEnhancerService:
 
                 return {
                     "original_query": original_query,
-                    "intent": parsed.get("intent", "tour_info"),
+                    "intent": parsed.get("intent", "general"),
                     "rewritten_query": parsed.get("rewritten_query", original_query),
                     "alternative_queries": parsed.get("alternative_queries", []),
                     "entities": parsed.get("entities", {})
@@ -109,6 +102,62 @@ class QueryEnhancerService:
             }
         }
 
+    async def decompose_query(self, query: str) -> Optional[Dict[str, str]]:
+        """
+        Декомпозиция запроса на независимые аспекты для параллельного поиска.
+
+        Returns:
+            {"original": query} — простой запрос, использовать baseline.
+            {"original": query, "aspect1": q1, ...} — сложный запрос, использовать decomposition.
+            None — ошибка парсинга, использовать baseline.
+        """
+        prompt = prompts_config.build_aspect_extraction_prompt(query)
+
+        try:
+            response = await app_state.llm_client.simple_query(prompt)
+            response_clean = response.strip()
+
+            if "<think>" in response_clean and "</think>" in response_clean:
+                response_clean = response_clean.split("</think>", 1)[1].strip()
+
+            if response_clean.startswith("```json"):
+                response_clean = response_clean[7:]
+            if response_clean.startswith("```"):
+                response_clean = response_clean[3:]
+            if response_clean.endswith("```"):
+                response_clean = response_clean[:-3]
+            response_clean = response_clean.strip()
+
+            aspects = json.loads(response_clean)
+
+            if not isinstance(aspects, dict):
+                print(f"[DECOMPOSITION] Invalid format (not dict): {type(aspects)}")
+                return None
+
+            if "original" not in aspects:
+                aspects["original"] = query
+
+            if "aspects" in aspects and isinstance(aspects["aspects"], dict):
+                nested = aspects.pop("aspects")
+                aspects.update(nested)
+
+            if any(not isinstance(v, str) for v in aspects.values()):
+                print(f"[DECOMPOSITION] Non-string values in aspects, skipping")
+                return None
+
+            print(f"[DECOMPOSITION] Extracted {len(aspects)} aspects for: {query[:60]}")
+            for name, q in aspects.items():
+                print(f"  - {name}: {q}")
+
+            return aspects
+
+        except json.JSONDecodeError as e:
+            print(f"[DECOMPOSITION] JSON parse error: {e}")
+            return None
+        except Exception as e:
+            print(f"[DECOMPOSITION] Unexpected error: {e}")
+            return None
+
     def build_search_queries(self, enhanced: Dict) -> List[str]:
         """
         Строит список запросов для поиска на основе результата enhancement.
@@ -120,15 +169,6 @@ class QueryEnhancerService:
         queries.extend(enhanced.get("alternative_queries", []))
 
         entities = enhanced.get("entities", {})
-
-        destinations = entities.get("destinations", [])
-        tour_types = entities.get("tour_types", [])
-
-        if destinations and tour_types:
-            for dest in destinations[:2]:
-                for tour_type in tour_types[:2]:
-                    queries.append(f"{tour_type} тур {dest}")
-
         key_terms = entities.get("key_terms", [])
         if key_terms and len(key_terms) >= 2:
             queries.append(" ".join(key_terms[:3]))

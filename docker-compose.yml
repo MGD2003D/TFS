@@ -5,7 +5,7 @@ services:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - ./qdrant_storage:/qdrant/storage
+      - qdrant_data:/qdrant/storage
     restart: unless-stopped
     networks:
       - tfs-network
@@ -38,6 +38,7 @@ services:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-admin}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-admin12345678}
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-documents}
+      - MINIO_CORPORATE_BUCKET=${MINIO_CORPORATE_BUCKET:-documents-corporate}
       - MINIO_SECURE=false
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
@@ -45,6 +46,8 @@ services:
       - CAILA_TOKEN=${CAILA_TOKEN}
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/app/.cache/huggingface
+      - SENTENCE_TRANSFORMERS_HOME=/app/.cache/huggingface/sentence_transformers
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface/transformers
     env_file:
       - .env
     depends_on:
@@ -61,3 +64,7 @@ services:
 networks:
   tfs-network:
     driver: bridge
+
+volumes:
+  qdrant_data:
+    driver: local

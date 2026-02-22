@@ -24,11 +24,13 @@ class IndexResponse(BaseModel):
 router = APIRouter()
 
 enable_query_enhancement = os.getenv('ENABLE_QUERY_ENHANCEMENT', 'true').lower() == 'true'
+enable_decomposition = os.getenv('ENABLE_DECOMPOSITION', 'true').lower() == 'true'
 
 rag_service = RAGService(
     min_relevance=0.25,
     default_top_k=5,
-    enable_query_enhancement=enable_query_enhancement
+    enable_query_enhancement=enable_query_enhancement,
+    enable_decomposition=enable_decomposition
 )
 
 
