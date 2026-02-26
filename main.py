@@ -82,18 +82,28 @@ async def lifespan(app: FastAPI):
     await minio_event_listener.start()
     print("Event Listener запущен")
 
-    print("\n8/8 Запуск Telegram бота...")
-    bot_token = os.getenv('BOT_TOKEN')
+    bot_platform = os.getenv('BOT_PLATFORM', 'tg').lower()
+    print(f"\n8/8 Запуск бота (платформа: {bot_platform})...")
 
-    from tg_bot.bot import dp, bot, initialize_services
-
-    initialize_services()
-
-    app_state.services_ready = True
-    print("Все сервисы инициализированы и готовы к работе")
-
-    bot_task = asyncio.create_task(dp.start_polling(bot))
-    print("Telegram бот запущен")
+    if bot_platform == 'max':
+        from max_bot.bot import dp as _dp, bot as _bot, initialize_services as _init
+        _init()
+        app_state.services_ready = True
+        print("Все сервисы инициализированы и готовы к работе")
+        # Remove any lingering webhook subscriptions before polling
+        try:
+            await _bot.delete_webhook()
+        except Exception:
+            pass
+        bot_task = asyncio.create_task(_dp.start_polling(_bot))
+        print("MAX бот запущен")
+    else:
+        from tg_bot.bot import dp, bot, initialize_services
+        initialize_services()
+        app_state.services_ready = True
+        print("Все сервисы инициализированы и готовы к работе")
+        bot_task = asyncio.create_task(dp.start_polling(bot))
+        print("Telegram бот запущен")
 
     print("\n=== ВСЕ СЕРВИСЫ ГОТОВЫ ===\n")
 
