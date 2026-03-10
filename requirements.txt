@@ -16,5 +16,6 @@ python-docx
 minio
 
 aiogram<4.0
+maxapi
 
 spacy

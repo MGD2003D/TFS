@@ -356,30 +356,21 @@ class RAGService:
         print(f"[RAG CHAT] Query Enhancement: {'ENABLED' if self.enable_query_enhancement else 'DISABLED'}")
         print(f"[RAG CHAT] Found {len(search_results)} unique results (after deduplication)")
 
-        if search_results:
-            print(f"\n[RAG CHAT] ALL results (sorted by score):")
-            for i, doc in enumerate(search_results, 1):
-                score = doc.get('score', 0)
-                above = "✓" if score >= self.min_relevance else "✗"
-                src = doc.get('metadata', {}).get('source', 'unknown')
-                chunk_id = doc.get('metadata', {}).get('chunk_id', 'N/A')
-                sq = doc.get('search_query', 'N/A')
-                dense = doc.get('dense_score')
-                sparse = doc.get('sparse_score')
-                score_detail = f"  [dense={dense:.4f} sparse={sparse:.4f}]" if dense is not None and sparse is not None else ""
-                print(f"  {above} [{i}] score={score:.4f}{score_detail}  src={src}  chunk={chunk_id}  query='{sq}'")
-                print(f"       text: {doc.get('text', '')[:120].replace(chr(10), ' ')}...")
-        else:
+        if not search_results:
             print(f"[RAG CHAT] ⚠ NO results returned from vector store!")
         print(f"{'='*80}\n")
 
+        use_history = os.getenv('USE_CONVERSATION_HISTORY', 'false').lower() == 'true'
+
         if not search_results:
-            app_state.add_role_message(user_id, query, role="user")
-            history = app_state.get_user_messages(user_id)
             llm_start = time.perf_counter()
-            answer = await app_state.llm_client.chat_query(history)
+            if use_history:
+                app_state.add_role_message(user_id, query, role="user")
+                answer = await app_state.llm_client.chat_query(app_state.get_user_messages(user_id))
+                app_state.add_role_message(user_id, answer, role="assistant")
+            else:
+                answer = await app_state.llm_client.simple_query(query)
             llm_time = time.perf_counter() - llm_start
-            app_state.add_role_message(user_id, answer, role="assistant")
             total_time = time.perf_counter() - total_start
             print(
                 "[timing] rag_chat: "
@@ -408,6 +399,20 @@ class RAGService:
         relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
         filter_time = time.perf_counter() - filter_start
 
+        # Log results AFTER normalization so ✓/✗ reflects actual filter outcome
+        print(f"[RAG CHAT] ALL results (normalized scores):")
+        for i, doc in enumerate(search_results, 1):
+            score = doc.get('score', 0)
+            above = "✓" if score >= self.min_relevance else "✗"
+            src = doc.get('metadata', {}).get('source', 'unknown')
+            chunk_id = doc.get('metadata', {}).get('chunk_id', 'N/A')
+            sq = doc.get('search_query', 'N/A')
+            dense = doc.get('dense_score')
+            sparse = doc.get('sparse_score')
+            score_detail = f"  [dense={dense:.4f} sparse={sparse:.4f}]" if dense is not None and sparse is not None else ""
+            print(f"  {above} [{i}] score={score:.4f}{score_detail}  src={src}  chunk={chunk_id}  query='{sq}'")
+            print(f"       text: {doc.get('text', '')[:120].replace(chr(10), ' ')}...")
+
         print(f"[RAG CHAT] Filter threshold={self.min_relevance}: {len(relevant_results)}/{len(search_results)} passed")
         if search_results and not relevant_results:
             best = search_results[0].get('score', 0)
@@ -429,15 +434,19 @@ class RAGService:
             print(context[:500] + "..." if len(context) > 500 else context)
             print(f"{'-'*80}\n")
         else:
-            user_message = query
-
-        app_state.add_role_message(user_id, user_message, role="user")
-        history = app_state.get_user_messages(user_id)
+            # No results passed threshold — try to extract referral info from low-score chunks
+            print(f"[RAG CHAT] No relevant results. Checking {len(search_results)} low-score chunks for referral info...")
+            referral_context = self._build_context(search_results[:3])
+            user_message = prompts_config.build_referral_prompt(referral_context, query)
 
         llm_start = time.perf_counter()
-        answer = await app_state.llm_client.chat_query(history)
+        if use_history:
+            app_state.add_role_message(user_id, user_message, role="user")
+            answer = await app_state.llm_client.chat_query(app_state.get_user_messages(user_id))
+            app_state.add_role_message(user_id, answer, role="assistant")
+        else:
+            answer = await app_state.llm_client.simple_query(user_message)
         llm_time = time.perf_counter() - llm_start
-        app_state.add_role_message(user_id, answer, role="assistant")
 
         sources = [{
             "text": doc["text"][:200] + "...",
@@ -606,8 +615,9 @@ class RAGService:
         else:
             answer = f"Я здесь, чтобы помочь! {ce.sparkles()} Задайте вопрос по документам."
 
-        app_state.add_role_message(user_id, query, role="user")
-        app_state.add_role_message(user_id, answer, role="assistant")
+        if os.getenv('USE_CONVERSATION_HISTORY', 'false').lower() == 'true':
+            app_state.add_role_message(user_id, query, role="user")
+            app_state.add_role_message(user_id, answer, role="assistant")
 
         total_time = time.perf_counter() - total_start
         print(f"[timing] small_talk: enhancement={enhancement_time:.3f}s total={total_time:.3f}s")
@@ -622,8 +632,9 @@ class RAGService:
 
         answer = "Пожалуйста, общайтесь вежливо. Чем могу помочь?"
 
-        app_state.add_role_message(user_id, query, role="user")
-        app_state.add_role_message(user_id, answer, role="assistant")
+        if os.getenv('USE_CONVERSATION_HISTORY', 'false').lower() == 'true':
+            app_state.add_role_message(user_id, query, role="user")
+            app_state.add_role_message(user_id, answer, role="assistant")
 
         total_time = time.perf_counter() - total_start
         print(f"[timing] inappropriate: enhancement={enhancement_time:.3f}s total={total_time:.3f}s")
@@ -638,8 +649,9 @@ class RAGService:
 
         answer = "Извините, этот вопрос выходит за рамки базы знаний. Задайте вопрос по документам."
 
-        app_state.add_role_message(user_id, query, role="user")
-        app_state.add_role_message(user_id, answer, role="assistant")
+        if os.getenv('USE_CONVERSATION_HISTORY', 'false').lower() == 'true':
+            app_state.add_role_message(user_id, query, role="user")
+            app_state.add_role_message(user_id, answer, role="assistant")
 
         total_time = time.perf_counter() - total_start
         print(f"[timing] off_topic: enhancement={enhancement_time:.3f}s total={total_time:.3f}s")
