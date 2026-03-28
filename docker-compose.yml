@@ -28,6 +28,7 @@ services:
       - tfs-network
 
   api:
+    image: mgd2003d/zho-nevskogo-bot-api:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -42,9 +43,12 @@ services:
       - MINIO_SECURE=false
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-      - BOT_TOKEN=${BOT_TOKEN}
+      - BOT_PLATFORM=${BOT_PLATFORM:-tg}
+      - BOT_TOKEN=${BOT_TOKEN:-}
+      - MAX_BOT_TOKEN=${MAX_BOT_TOKEN:-}
       - CAILA_TOKEN=${CAILA_TOKEN}
       - HF_TOKEN=${HF_TOKEN:-}
+      - USE_CONVERSATION_HISTORY=${USE_CONVERSATION_HISTORY:-false}
       - HF_HOME=/app/.cache/huggingface
       - SENTENCE_TRANSFORMERS_HOME=/app/.cache/huggingface/sentence_transformers
       - TRANSFORMERS_CACHE=/app/.cache/huggingface/transformers
