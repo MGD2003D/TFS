@@ -425,7 +425,7 @@ class RAGService:
 
         for idx, (source, chunks) in enumerate(seen_sources.items(), 1):
             context_parts.append(f"[Документ {idx}: {source}]")
-            for chunk in sorted(chunks, key=lambda x: x['chunk_id']):
+            for chunk in sorted(chunks, key=lambda x: -x['score']):
                 context_parts.append(f"{chunk['text']}\n")
 
         return "\n".join(context_parts)
