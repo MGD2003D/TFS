@@ -191,7 +191,9 @@ class QdrantVectorStore(BaseVectorStore):
             self.sparse_vocab_ready = True
 
         prefixed_texts = [f"passage: {text}" for text in texts] if self._use_prefixes() else texts
-        embeddings = self.embedding_model.encode(prefixed_texts, show_progress_bar=True, normalize_embeddings=True)
+        import torch
+        encode_batch = 128 if torch.cuda.is_available() else 64
+        embeddings = self.embedding_model.encode(prefixed_texts, batch_size=encode_batch, show_progress_bar=True, normalize_embeddings=True)
 
         points = []
         for idx, (text, embedding) in enumerate(zip(texts, embeddings)):

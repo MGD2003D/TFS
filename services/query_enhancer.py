@@ -14,7 +14,15 @@ class QueryEnhancerService:
     - Переформулирование запроса в поисковый вид
     - Добавление доменных терминов туризма
     - Генерация альтернативных вариантов запроса
+    - Анализ сложности запроса (simple / parallel / sequential)
+    - Адаптивный выбор стратегии поиска
     """
+
+    # Стратегии поиска
+    STRATEGY_BASELINE = "baseline"           # Простой запрос → прямой поиск
+    STRATEGY_REFORMULATION = "reformulation" # Переформулирование + альтернативы
+    STRATEGY_DECOMPOSITION = "decomposition" # Параллельные аспекты + weighted RRF
+    STRATEGY_MULTIHOP = "multihop"           # Последовательные хопы с контекстом
 
     def __init__(self):
         self.tourism_domains = [
@@ -134,3 +142,61 @@ class QueryEnhancerService:
             queries.append(" ".join(key_terms[:3]))
 
         return queries[:5]
+
+    async def analyze_complexity(self, query: str) -> Optional[Dict]:
+        """
+        Анализирует сложность запроса через LLM (aspect extraction).
+
+        Returns:
+            - {"type": "simple", "original": "query"}
+            - {"type": "parallel", "original": "query", "aspects": {...}}
+            - {"type": "sequential", "original": "query", "hops": [...]}
+            - None при ошибке (fallback to baseline)
+        """
+        start = time.perf_counter()
+        result = await app_state.llm_client.extract_aspects(query)
+        elapsed = time.perf_counter() - start
+        print(f"[COMPLEXITY ANALYSIS] Completed in {elapsed:.3f}s")
+        return result
+
+    def detect_strategy(self, enhanced: Dict, complexity: Optional[Dict] = None) -> str:
+        """
+        Определяет оптимальную стратегию поиска на основе результатов enhance и complexity.
+
+        Args:
+            enhanced: Результат enhance_query()
+            complexity: Результат analyze_complexity() (опционально)
+
+        Returns:
+            Одна из стратегий: baseline, reformulation, decomposition, multihop
+        """
+        intent = enhanced.get("intent", "")
+
+        # Специальные интенты не требуют сложных стратегий
+        if intent in ("small_talk", "inappropriate", "off_topic", "list_tours", "filtered_list"):
+            return self.STRATEGY_BASELINE
+
+        # Если есть результат анализа сложности — используем его
+        if complexity and isinstance(complexity, dict):
+            query_type = complexity.get("type", "simple")
+
+            if query_type == "sequential":
+                hops = complexity.get("hops", [])
+                if len(hops) >= 2:
+                    print(f"[STRATEGY] → multihop ({len(hops)} hops)")
+                    return self.STRATEGY_MULTIHOP
+
+            if query_type == "parallel":
+                aspects = complexity.get("aspects", {})
+                if len(aspects) >= 2:
+                    print(f"[STRATEGY] → decomposition ({len(aspects)} aspects)")
+                    return self.STRATEGY_DECOMPOSITION
+
+        # Если есть альтернативные запросы — reformulation
+        alternatives = enhanced.get("alternative_queries", [])
+        if alternatives:
+            print(f"[STRATEGY] → reformulation ({len(alternatives)} alternatives)")
+            return self.STRATEGY_REFORMULATION
+
+        print(f"[STRATEGY] → baseline")
+        return self.STRATEGY_BASELINE

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 
 class BaseLLMClient(ABC):
@@ -28,3 +28,19 @@ class BaseLLMClient(ABC):
     @abstractmethod
     async def cleanup(self) -> None:
         pass
+
+    async def extract_aspects(self, query: str) -> Optional[Dict]:
+        """
+        Анализирует сложность запроса и извлекает аспекты/хопы.
+        Дефолтная реализация возвращает None (fallback to baseline).
+        Переопределяется в клиентах с поддержкой aspect extraction.
+        """
+        return None
+
+    async def extract_triplets(self, query: str, context: str) -> List[Dict]:
+        """
+        Извлекает триплеты (subject, predicate, object, confidence) из документов.
+        Дефолтная реализация возвращает пустой список.
+        Переопределяется в клиентах с поддержкой triplet extraction.
+        """
+        return []

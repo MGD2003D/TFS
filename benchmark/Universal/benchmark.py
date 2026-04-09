@@ -26,6 +26,9 @@ from knowledge_graph import KnowledgeGraph, Triplet, extract_triplets_from_dag_r
 _entity_boost_enabled = False
 _entity_boost_weight = 0.3
 
+# LLM backend (set from --llm arg)
+_llm_backend = "qwen"
+
 
 # =============================================================================
 # Reranker (lazy loaded)
@@ -236,15 +239,33 @@ class Logger:
 # API Key management with retry
 # =============================================================================
 
-async def init_llm_with_key(api_key: Optional[str] = None):
-    """Initialize LLM with optional API key override."""
+async def init_llm_with_key(api_key: Optional[str] = None, llm: str = "qwen"):
+    """
+    Initialize LLM with optional API key override.
+
+    Args:
+        api_key: override CAILA_TOKEN
+        llm: which LLM to use — "qwen" (default) or "gemini"
+              gemini model can be specified as "gemini:gemini-2.5-flash"
+    """
     import app_state
-    from services.llm.caila_client import CailaClient
 
     if api_key:
         os.environ["CAILA_TOKEN"] = api_key
 
-    client = CailaClient()
+    if llm.startswith("gemini"):
+        from services.llm.gemini_client import GeminiClient
+        # Support "gemini" or "gemini:gemini-2.5-flash"
+        model = "gemini-2.5-flash"
+        if ":" in llm:
+            model = llm.split(":", 1)[1]
+        client = GeminiClient(model=model)
+        print(f"[LLM] Using Gemini ({model})")
+    else:
+        from services.llm.caila_client import CailaClient
+        client = CailaClient()
+        print(f"[LLM] Using Qwen3-30B (Caila)")
+
     app_state.llm_client = client
     await client.initialize()
     return client
@@ -259,10 +280,13 @@ def prompt_for_api_key():
     return api_key
 
 
-async def call_with_retry(func, *args, max_retries=7, **kwargs):
+async def call_with_retry(func, *args, max_retries=7, llm_backend: str = "qwen", **kwargs):
     """
     Call async function with retry logic.
     After max_retries, prompt for new API key.
+
+    Args:
+        llm_backend: passed to init_llm_with_key on reinit after key change
     """
     retries = 0
     current_api_key = None
@@ -309,7 +333,7 @@ async def call_with_retry(func, *args, max_retries=7, **kwargs):
                     if hasattr(app_state, 'llm_client') and app_state.llm_client:
                         await app_state.llm_client.cleanup()
                     
-                    await init_llm_with_key(current_api_key)
+                    await init_llm_with_key(current_api_key, llm=llm_backend)
                     
                     # Also update enhancer if needed
                     from services.query_enhancer import QueryEnhancerService
@@ -359,7 +383,286 @@ async def init_query_enhancer():
 # Dataset loading
 # =============================================================================
 
+# =============================================================================
+# HuggingFace dataset adapters
+# Wrap HF datasets to expose the same interface as ir_datasets:
+#   .queries_iter() → namedtuple-like with .query_id, .text
+#   .docs_iter()    → namedtuple-like with .doc_id, .text
+#   .qrels_iter()   → namedtuple-like with .query_id, .doc_id, .relevance
+# =============================================================================
+
+class _Q:
+    """Minimal query container."""
+    def __init__(self, query_id, text):
+        self.query_id = query_id
+        self.text = text
+
+class _D:
+    """Minimal document container."""
+    def __init__(self, doc_id, text):
+        self.doc_id = doc_id
+        self.text = text
+
+class _R:
+    """Minimal qrel container."""
+    def __init__(self, query_id, doc_id, relevance=1):
+        self.query_id = query_id
+        self.doc_id = doc_id
+        self.relevance = relevance
+
+
+class HFDatasetAdapter:
+    """
+    Wraps a HuggingFace dataset to expose ir_datasets-compatible interface.
+    Each subclass implements _iter_queries, _iter_docs, _iter_qrels.
+    """
+    def queries_iter(self):
+        return self._iter_queries()
+
+    def docs_iter(self):
+        return self._iter_docs()
+
+    def qrels_iter(self):
+        return self._iter_qrels()
+
+
+class PopQAAdapter(HFDatasetAdapter):
+    """
+    PopQA: akariasai/PopQA, split=test
+    Fields: id, question, possible_answers (list), prop, subj, obj, s_pop, o_pop
+    No separate corpus — answers are inline. We create synthetic single-sentence docs.
+    """
+    def __init__(self, hf_ds):
+        self._ds = hf_ds
+
+    def _iter_queries(self):
+        for row in self._ds:
+            yield _Q(str(row["id"]), row["question"])
+
+    def _iter_docs(self):
+        # Each answer becomes a minimal document
+        for row in self._ds:
+            qid = str(row["id"])
+            answers = row.get("possible_answers") or []
+            if isinstance(answers, str):
+                import json as _json
+                try:
+                    answers = _json.loads(answers)
+                except Exception:
+                    answers = [answers]
+            for i, ans in enumerate(answers):
+                doc_id = f"{qid}_ans_{i}"
+                text = f"{row['question']} {ans}"
+                yield _D(doc_id, text)
+
+    def _iter_qrels(self):
+        for row in self._ds:
+            qid = str(row["id"])
+            answers = row.get("possible_answers") or []
+            if isinstance(answers, str):
+                import json as _json
+                try:
+                    answers = _json.loads(answers)
+                except Exception:
+                    answers = [answers]
+            for i in range(len(answers)):
+                yield _R(qid, f"{qid}_ans_{i}", relevance=1)
+
+
+class HotpotQAAdapter(HFDatasetAdapter):
+    """
+    HotpotQA: hotpot_qa, fullwiki, split=validation
+    Fields: id, question, answer, context (dict: title→sentences), type, level
+    """
+    def __init__(self, hf_ds):
+        self._ds = hf_ds
+
+    def _iter_queries(self):
+        for row in self._ds:
+            yield _Q(row["id"], row["question"])
+
+    def _iter_docs(self):
+        seen = set()
+        for row in self._ds:
+            context = row.get("context", {})
+            titles = context.get("title", [])
+            sentences_list = context.get("sentences", [])
+            for title, sentences in zip(titles, sentences_list):
+                doc_id = f"hotpot_{title.replace(' ', '_')[:80]}"
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                text = title + " " + " ".join(sentences)
+                yield _D(doc_id, text)
+
+    def _iter_qrels(self):
+        for row in self._ds:
+            qid = row["id"]
+            context = row.get("context", {})
+            titles = context.get("title", [])
+            supporting = row.get("supporting_facts", {})
+            sup_titles = set(supporting.get("title", [])) if supporting else set(titles)
+            for title in sup_titles:
+                doc_id = f"hotpot_{title.replace(' ', '_')[:80]}"
+                yield _R(qid, doc_id, relevance=1)
+
+
+class TwoWikiAdapter(HFDatasetAdapter):
+    """
+    2WikiMultiHopQA: framolfese/2WikiMultihopQA, split=validation
+    Fields: id, question, answer, type, supporting_facts {title, sent_id}, context {title, sentences}
+    Same structure as HotpotQA.
+    """
+    def __init__(self, hf_ds, dataset_name: str):
+        self._ds = hf_ds
+        self._name = dataset_name
+
+    def _iter_queries(self):
+        for row in self._ds:
+            yield _Q(str(row["id"]), row["question"])
+
+    def _iter_docs(self):
+        seen = set()
+        for row in self._ds:
+            context = row.get("context", {})
+            titles = context.get("title", [])
+            sentences_list = context.get("sentences", [])
+            for title, sentences in zip(titles, sentences_list):
+                doc_id = f"2wiki_{title.replace(' ', '_')[:80]}"
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                text = title + " " + " ".join(sentences)
+                yield _D(doc_id, text)
+
+    def _iter_qrels(self):
+        for row in self._ds:
+            qid = str(row["id"])
+            # supporting_facts contains the titles of relevant docs
+            sup = row.get("supporting_facts", {})
+            for title in sup.get("title", []):
+                yield _R(qid, f"2wiki_{title.replace(' ', '_')[:80]}", relevance=1)
+
+
+class AmbigNQAdapter(HFDatasetAdapter):
+    """
+    AmbigNQ: ambig_qa, light, split=validation
+    Fields: id, question, annotations (dict with answers)
+    """
+    def __init__(self, hf_ds):
+        self._ds = hf_ds
+
+    def _iter_queries(self):
+        for row in self._ds:
+            yield _Q(str(row["id"]), row["question"])
+
+    @staticmethod
+    def _extract_answers(annotations) -> list:
+        """Extract answer strings from ambig_qa annotations field.
+        HuggingFace returns annotations as dict-of-lists:
+          {"type": ["singleAnswer", ...], "answer": [["ans"], {"answer": ["ans2"]}, ...]}
+        """
+        answers = []
+        if not annotations:
+            return answers
+        if isinstance(annotations, dict):
+            raw = annotations.get("answer") or []
+        elif isinstance(annotations, list):
+            # List of annotation dicts: [{"type": "singleAnswer", "answer": ["ans"]}, ...]
+            raw = []
+            for item in annotations:
+                if isinstance(item, dict):
+                    raw.extend(item.get("answer") or [])
+                elif isinstance(item, str):
+                    raw.append(item)
+            return [a for a in raw if isinstance(a, str)]
+        else:
+            return answers
+        for a in raw:
+            if isinstance(a, str):
+                answers.append(a)
+            elif isinstance(a, list):
+                answers.extend(x for x in a if isinstance(x, str))
+            elif isinstance(a, dict):
+                sub = a.get("answer") or []
+                if isinstance(sub, list):
+                    answers.extend(x for x in sub if isinstance(x, str))
+                elif isinstance(sub, str):
+                    answers.append(sub)
+        return answers
+
+    def _iter_docs(self):
+        seen = set()
+        for row in self._ds:
+            qid = str(row["id"])
+            answers = self._extract_answers(row.get("annotations"))
+            for i, ans in enumerate(answers):
+                doc_id = f"{qid}_ans_{i}"
+                if doc_id not in seen:
+                    seen.add(doc_id)
+                    yield _D(doc_id, f"{row['question']} {ans}")
+
+    def _iter_qrels(self):
+        for row in self._ds:
+            qid = str(row["id"])
+            answers = self._extract_answers(row.get("annotations"))
+            for i in range(len(answers)):
+                yield _R(qid, f"{qid}_ans_{i}", relevance=1)
+
+
+# HF dataset IDs that are handled via adapters (not ir_datasets)
+HF_DATASETS = {
+    "popqa":        ("akariasai/PopQA",            {"split": "test"}),
+    "hotpotqa_hf":  ("hotpotqa/hotpot_qa",         {"name": "fullwiki", "split": "validation"}),
+    "2wikimultihop":("framolfese/2WikiMultihopQA",  {"split": "validation"}),
+    "hover":        ("hover",                       {"split": "validation"}),
+    "ambignq":      ("sewon/ambig_qa",             {"name": "light", "split": "validation"}),
+}
+
+# Expected strategy per dataset (ground truth for confusion matrix)
+# Based on query complexity characteristics of each dataset
+DATASET_EXPECTED_STRATEGY = {
+    # Single-hop factoid: no decomposition needed
+    "popqa":             "baseline",
+    "beir/nq":           "baseline",
+    "beir/msmarco":      "baseline",
+    "beir/trec-covid":   "baseline",
+    "beir/fiqa":         "baseline",
+    "beir/scifact":      "baseline",
+    "beir/arguana":      "baseline",
+    # Multi-hop sequential: each step depends on previous result
+    "hotpotqa_hf":       "multihop",
+    "beir/hotpotqa":     "multihop",
+    "hover":             "multihop",
+    # Multi-hop parallel: multiple independent aspects/constraints
+    "2wikimultihop":     "decomposition",
+    # Ambiguous questions: benefit from query expansion / multiple angles
+    "ambignq":           "decomposition",
+    "beir/nfcorpus":     "decomposition",
+}
+
+
 def load_ds(dataset_id: str):
+    """
+    Load dataset by ID. Supports:
+    - ir_datasets IDs: "beir/hotpotqa", "beir/nq", etc.
+    - HF shorthand IDs: "popqa", "hotpotqa_hf", "2wikimultihop", "hover", "ambignq"
+    """
+    if dataset_id in HF_DATASETS:
+        from datasets import load_dataset as hf_load
+        hf_name, hf_kwargs = HF_DATASETS[dataset_id]
+        print(f"[DATASET] Loading HuggingFace dataset: {hf_name} ({hf_kwargs})")
+        hf_ds = hf_load(hf_name, **hf_kwargs)
+
+        if dataset_id == "popqa":
+            return PopQAAdapter(hf_ds)
+        elif dataset_id == "hotpotqa_hf":
+            return HotpotQAAdapter(hf_ds)
+        elif dataset_id in ("2wikimultihop", "hover"):
+            return TwoWikiAdapter(hf_ds, dataset_id)
+        elif dataset_id == "ambignq":
+            return AmbigNQAdapter(hf_ds)
+
     return ir_datasets.load(dataset_id)
 
 
@@ -377,6 +680,86 @@ def take_queries(ds, max_queries: int) -> Dict[str, str]:
         raise AttributeError(f"Dataset {ds} does not have queries_iter()")
     
     return queries
+
+
+def build_gold_answers(ds, allowed_qids: set) -> Dict[str, List[str]]:
+    """Extract gold answer strings for QA datasets (not available for BEIR)."""
+    gold = {}
+    if not hasattr(ds, '_ds'):
+        return gold  # BEIR / ir_datasets — no answer strings
+    for row in ds._ds:
+        qid = str(row.get("id", ""))
+        if qid not in allowed_qids:
+            continue
+        answers = []
+        # popqa
+        if "possible_answers" in row:
+            raw = row["possible_answers"] or []
+            if isinstance(raw, str):
+                import json as _j
+                try:
+                    raw = _j.loads(raw)
+                except Exception:
+                    raw = [raw]
+            answers = [a for a in raw if isinstance(a, str)]
+        # hotpotqa / 2wiki
+        elif "answer" in row and isinstance(row["answer"], str):
+            answers = [row["answer"]]
+        # ambignq
+        elif "annotations" in row:
+            answers = AmbigNQAdapter._extract_answers(row.get("annotations"))
+        if answers:
+            gold[qid] = answers
+    return gold
+
+
+def _normalize_answer(s: str) -> str:
+    import re, string
+    s = s.lower().strip()
+    s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    s = ''.join(c for c in s if c not in string.punctuation)
+    return ' '.join(s.split())
+
+
+def compute_em(prediction: str, gold_answers: List[str]) -> float:
+    pred = _normalize_answer(prediction)
+    return float(any(_normalize_answer(g) == pred for g in gold_answers))
+
+
+def compute_f1_score(prediction: str, gold_answers: List[str]) -> float:
+    pred_tokens = _normalize_answer(prediction).split()
+    best = 0.0
+    for gold in gold_answers:
+        gold_tokens = _normalize_answer(gold).split()
+        common = set(pred_tokens) & set(gold_tokens)
+        if not common:
+            continue
+        p = len(common) / len(pred_tokens)
+        r = len(common) / len(gold_tokens)
+        f1 = 2 * p * r / (p + r)
+        best = max(best, f1)
+    return best
+
+
+def compute_contains(prediction: str, gold_answers: List[str]) -> float:
+    pred = _normalize_answer(prediction)
+    return float(any(_normalize_answer(g) in pred for g in gold_answers))
+
+
+async def generate_rag_answer(query: str, hits: List, llm_client) -> str:
+    """Generate answer from retrieved docs using LLM."""
+    context_parts = []
+    for i, hit in enumerate(hits[:5], 1):
+        context_parts.append(f"[{i}] {hit.text[:300]}")
+    context = "\n".join(context_parts)
+    prompt = (
+        f"Answer the question based on the context below. "
+        f"Give a short, direct answer (1-5 words).\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        f"Answer:"
+    )
+    return await llm_client.simple_query(prompt)
 
 
 def build_qrels(ds, allowed_qids: set) -> Dict[str, List[str]]:
@@ -680,12 +1063,10 @@ async def index_documents(store, documents: Dict[str, str], batch_size: int = 25
     else:
         print(f"[INDEX] NER disabled - indexing without entity extraction")
 
-    if max_workers > 1:
-        print(f"[INDEX] Using {max_workers} parallel workers for indexing")
-        await index_documents_parallel(store, items, batch_size, enable_ner, max_workers, t0)
-    else:
-        print(f"[INDEX] Sequential indexing")
-        await index_documents_sequential(store, items, batch_size, enable_ner, t0)
+    # Indexing is GPU-bound (single encoder), parallel workers cause deadlock on CUDA
+    # max_workers is still used for query processing later
+    print(f"[INDEX] Sequential indexing (GPU encoder is single-threaded)")
+    await index_documents_sequential(store, items, batch_size, enable_ner, t0)
 
     print(f"[INDEX] done: {len(items)} docs in {time.perf_counter()-t0:.1f}s")
 
@@ -955,7 +1336,7 @@ async def retrieve_agentic(
         return enhancer.build_search_queries(enhanced_result) or [query]
 
     try:
-        variants = await call_with_retry(enhance_with_fallback, max_retries=7)
+        variants = await call_with_retry(enhance_with_fallback, max_retries=7, llm_backend=_llm_backend)
     except Exception as e:
         print(f"[FALLBACK] Query enhancement failed: {e}")
         if logger:
@@ -1145,9 +1526,19 @@ async def retrieve_decomposition(
     import time
     t0 = time.perf_counter()
 
-    aspects = await llm.extract_aspects(query)
+    raw_aspects = await llm.extract_aspects(query)
 
     debug["extraction_ms"] = (time.perf_counter() - t0) * 1000.0
+
+    # Normalize new format (type/aspects/hops) to flat dict
+    if raw_aspects and isinstance(raw_aspects, dict) and "type" in raw_aspects:
+        if raw_aspects["type"] == "parallel" and "aspects" in raw_aspects:
+            aspects = {"original": raw_aspects["original"]}
+            aspects.update(raw_aspects["aspects"])
+        else:
+            aspects = {"original": raw_aspects.get("original", query)}
+    else:
+        aspects = raw_aspects
 
     # =============================================================================
     # HUMANFACTOR: Add reformulated query variant
@@ -1313,16 +1704,17 @@ async def retrieve_multihop(
     top_k: int = 10,
     fusion: str = "rrf",
     search_mode: str = "hybrid",
+    graph=None,
     logger=None
 ):
     """
-    Multihop retrieval using PankRAG DAG execution (paper 2506.11106v2).
+    Multihop retrieval with sequential hops and optional graph cache.
 
     Strategy:
-    1. Extract DAG with dependencies via LLM
-    2. Bottom-up execution: resolve dependencies level-by-level
-    3. Top-down refinement: refine original query with resolved answers
-    4. Dependency-aware reranking: α × Ri + β × Mi
+    1. Extract hops via LLM (new sequential format)
+    2. For each hop: graph lookup → search → LLM extract → graph save
+    3. Top-down refinement with all resolved answers
+    4. Dependency-aware reranking
 
     Args:
         store: Vector store
@@ -1331,168 +1723,182 @@ async def retrieve_multihop(
         top_k: Number of results to return
         fusion: Fusion strategy for hybrid search
         search_mode: dense/sparse/hybrid
+        graph: Optional KnowledgeGraph for lazy caching
         logger: Optional logger
 
     Returns:
         (hits, debug_info)
     """
 
-    debug = {"aspects_count": 0, "dag_levels": 0, "extraction_ms": 0.0}
+    debug = {"aspects_count": 0, "dag_levels": 0, "extraction_ms": 0.0, "graph_hits": 0, "graph_saves": 0}
 
     if logger:
         logger.log("\n" + "="*80)
         logger.log(f"[MULTIHOP] Query: {query}")
+        logger.log(f"[MULTIHOP] Graph: {'ON' if graph else 'OFF'}")
         logger.log("="*80)
 
     # =============================================================================
-    # PHASE 1: DAG Extraction
+    # PHASE 1: Extraction
     # =============================================================================
 
     import time
     t0 = time.perf_counter()
 
-    # Extract DAG with dependencies
-    dag = await llm.extract_aspects(query)  # Returns dict with aspects + execution_order
+    raw = await llm.extract_aspects(query)
 
     debug["extraction_ms"] = (time.perf_counter() - t0) * 1000.0
 
-    # Fallback if extraction failed or no dependencies
-    if dag is None or len(dag.get("aspects", {})) == 1:
-        if logger:
-            logger.log(f"[MULTIHOP] No dependencies, fallback to baseline")
+    # Normalize format
+    if raw is None:
         debug["fallback"] = "baseline"
         hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
         return hits, debug
 
-    aspects = dag["aspects"]
-    execution_order = dag.get("execution_order", [[]])
+    query_type = raw.get("type", "simple")
+    hops = raw.get("hops", [])
 
-    debug["aspects_count"] = len(aspects)
-    debug["dag_levels"] = len(execution_order)
+    # If not sequential or <2 hops, fallback
+    if query_type != "sequential" or len(hops) < 2:
+        # Try as decomposition if parallel
+        if query_type == "parallel" and raw.get("aspects"):
+            if logger:
+                logger.log(f"[MULTIHOP] Got parallel type, delegating to decomposition")
+            # Convert to flat format for decomposition
+            flat_aspects = {"original": raw["original"]}
+            flat_aspects.update(raw["aspects"])
+            debug["fallback"] = "decomposition"
+            # Inline decomposition (simplified)
+            hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
+            return hits, debug
+
+        if logger:
+            logger.log(f"[MULTIHOP] Simple/no hops, fallback to baseline")
+        debug["fallback"] = "baseline"
+        hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
+        return hits, debug
+
+    debug["aspects_count"] = len(hops)
+    debug["dag_levels"] = len(hops)
 
     if logger:
-        logger.log(f"\n[DAG] Extracted {len(aspects)} aspects in {len(execution_order)} levels:")
-        for level_idx, batch in enumerate(execution_order):
-            logger.log(f"  Level {level_idx}: {batch}")
+        logger.log(f"\n[HOPS] {len(hops)} sequential hops:")
+        for i, hop in enumerate(hops, 1):
+            logger.log(f"  Hop {i}: {hop.get('query', '?')} → extract: {hop.get('extract', '?')}")
 
     # =============================================================================
-    # PHASE 2: Bottom-up DAG Execution
+    # PHASE 2: Sequential Hop Execution with Graph Cache
     # =============================================================================
 
-    results_by_aspect = {}
-    resolved_answers = {}  # aspect_key -> top-1 result text
+    results_by_hop = {}
+    resolved_answers = {}
+    prev_context = ""
+    triplets_to_save = []
 
-    for level_idx, batch in enumerate(execution_order):
+    for hop_idx, hop in enumerate(hops):
+        hop_query_template = hop.get("query", "")
+        extract_hint = hop.get("extract", "")
+
+        # Substitute {prev} with resolved context
+        hop_query = hop_query_template
+        if prev_context and "{prev}" in hop_query:
+            hop_query = hop_query.replace("{prev}", prev_context)
+
+        hop_key = f"hop_{hop_idx}"
+
         if logger:
-            logger.log(f"\n[LEVEL {level_idx}] Executing batch: {batch}")
+            logger.log(f"\n[HOP {hop_idx + 1}] Query: {hop_query}")
 
-        tasks = []
-        for aspect_key in batch:
-            aspect = aspects[aspect_key]
-            aspect_query = aspect.get("query", query)
+        # === GRAPH LOOKUP ===
+        graph_hit = None
+        if graph and hop_idx < len(hops) - 1:
+            try:
+                graph_results = graph.search_semantic(hop_query, limit=3)
+                if graph_results:
+                    best_triplet, best_score = graph_results[0]
+                    if best_score >= 0.75:
+                        graph_hit = best_triplet.get("object", "")
+                        debug["graph_hits"] += 1
+                        if logger:
+                            logger.log(f"  [GRAPH HIT] '{graph_hit}' (score={best_score:.3f})")
+            except Exception as e:
+                if logger:
+                    logger.log(f"  [GRAPH] Lookup error: {e}")
 
-            # Substitute placeholders with resolved answers from dependencies
-            for dep_key in aspect.get("dependencies", []):
-                if dep_key in resolved_answers:
-                    placeholder = f"[{dep_key}]"
-                    aspect_query = aspect_query.replace(placeholder, resolved_answers[dep_key])
+        # Search
+        results = await search_store(store, hop_query, top_k=20, fusion=fusion, search_mode=search_mode)
+        results_by_hop[hop_key] = results
 
-            tasks.append(search_store(store, aspect_query, top_k=20, fusion=fusion, search_mode=search_mode))
-
-        # Parallel execution within level
-        batch_results = await asyncio.gather(*tasks)
-
-        for aspect_key, results in zip(batch, batch_results):
-            results_by_aspect[aspect_key] = results
-
-            # Extract answer from top-1 result
-            if results:
-                resolved_answers[aspect_key] = results[0].get("text", "")[:200]  # First 200 chars
-
-            if logger:
-                logger.log(f"  [{aspect_key}] found {len(results)} results")
-
-    # =============================================================================
-    # KNOWLEDGE GRAPH: Cache resolved relationships
-    # =============================================================================
-
-    try:
-        # Initialize knowledge graph (stores triplets in Qdrant)
-        kg = KnowledgeGraph(
-            qdrant_client=store.client,
-            embedding_model=store.embedding_model,
-            collection_name="knowledge_graph"
-        )
-
-        # Extract triplets from resolved DAG relationships
-        triplets = extract_triplets_from_dag_results(dag, results_by_aspect, resolved_answers)
-
-        if triplets:
-            # Add triplets to graph (batch operation)
-            triplet_ids = kg.add_triplets_batch(triplets)
-
-            if logger:
-                logger.log(f"\n[GRAPH] Stored {len(triplet_ids)} triplets:")
-                for triplet in triplets[:3]:  # Show first 3
-                    logger.log(f"  ({triplet.subject[:30]}..., {triplet.predicate}, {triplet.object[:30]}...)")
-                if len(triplets) > 3:
-                    logger.log(f"  ... and {len(triplets) - 3} more")
-
-            debug["graph_triplets"] = len(triplets)
-        else:
-            if logger:
-                logger.log(f"\n[GRAPH] No triplets extracted (no dependencies)")
-            debug["graph_triplets"] = 0
-
-    except Exception as e:
-        # Don't fail the entire pipeline if graph storage fails
         if logger:
-            logger.log(f"\n[GRAPH] Error storing triplets: {e}")
-        debug["graph_error"] = str(e)
+            logger.log(f"  Found {len(results)} results")
+
+        # Extract context for next hop
+        if hop_idx < len(hops) - 1:
+            if graph_hit:
+                prev_context = graph_hit
+            elif results:
+                prev_context = results[0].get("text", "")[:200]
+            resolved_answers[hop_key] = prev_context
+
+            # Save triplet for graph (if no graph hit — it's new knowledge)
+            if not graph_hit and prev_context and len(prev_context) < 200:
+                triplets_to_save.append({
+                    "subject": hop_query,
+                    "predicate": extract_hint or "resolves_to",
+                    "object": prev_context,
+                })
+
+            if logger:
+                source = "GRAPH" if graph_hit else "TOP-1"
+                logger.log(f"  [{source}] Context: {prev_context[:100]}...")
+
+    # === GRAPH SAVE ===
+    if graph and triplets_to_save:
+        try:
+            for t in triplets_to_save:
+                triplet = Triplet(
+                    subject=t["subject"],
+                    predicate=t["predicate"],
+                    object=t["object"],
+                    confidence=0.8,
+                )
+                graph.add_triplet(triplet)
+            debug["graph_saves"] = len(triplets_to_save)
+            if logger:
+                logger.log(f"\n[GRAPH] Saved {len(triplets_to_save)} triplets")
+                for t in triplets_to_save[:3]:
+                    logger.log(f"  ({t['subject'][:40]}) --[{t['predicate']}]--> ({t['object'][:40]})")
+        except Exception as e:
+            if logger:
+                logger.log(f"\n[GRAPH] Save error: {e}")
 
     # =============================================================================
     # PHASE 3: Top-down Refinement
     # =============================================================================
 
-    # Refine original query with all resolved answers
     refined_query = query
-    for aspect_key, answer in resolved_answers.items():
-        if aspect_key != "original":
-            refined_query += f" {answer}"
+    for hop_key, answer in resolved_answers.items():
+        refined_query += f" {answer}"
 
     if logger:
         logger.log(f"\n[TOP-DOWN] Refined query: {refined_query[:150]}...")
 
-    # Final retrieval with refined query
     final_results = await search_store(store, refined_query, top_k=top_k*2, fusion=fusion, search_mode=search_mode)
-    results_by_aspect["refined"] = final_results
+    results_by_hop["refined"] = final_results
 
     # =============================================================================
-    # PHASE 4: Dependency-Aware Reranking (PankRAG Equation 5)
+    # PHASE 4: Reranking
     # =============================================================================
 
-    # Determine query type (SCQ vs ACQ) based on DAG structure
-    has_sequential_deps = len(execution_order) > 1
-    query_type = "SCQ" if has_sequential_deps else "ACQ"
-
-    # PankRAG weights (Section 3.4)
-    if query_type == "SCQ":
-        alpha, beta = 0.6, 0.4  # Multihop queries
-    else:
-        alpha, beta = 0.75, 0.25  # Abstract queries
+    alpha, beta = 0.6, 0.4  # Sequential queries
 
     if logger:
-        logger.log(f"\n[RERANKING] Query type: {query_type}, weights: α={alpha}, β={beta}")
+        logger.log(f"\n[RERANKING] weights: α={alpha}, β={beta}")
 
-    # Combined scoring: final_score = α × Ri + β × Mi
     combined_results = {}
 
-    for aspect_key, results in results_by_aspect.items():
-        aspect = aspects.get(aspect_key, {})
-        dep_keys = aspect.get("dependencies", [])
-
-        # Get resolved dependency answers for Mi computation
-        dep_answers = {k: resolved_answers.get(k, "") for k in dep_keys if k in resolved_answers}
+    for hop_key, results in results_by_hop.items():
+        dep_answers_list = [v for k, v in resolved_answers.items() if v]
 
         for result in results:
             doc_id = result.get("metadata", {}).get("doc_id", "")
@@ -1500,18 +1906,8 @@ async def retrieve_multihop(
                 continue
 
             text = result.get("text", "")
-
-            # Ri: Intrinsic retrieval quality (Qdrant score)
             Ri = result.get("score", 0.0)
-
-            # Mi: Dependency similarity (PankRAG Equation 4)
-            Mi = 0.0
-            if dep_answers:
-                # Compute cosine similarity with dependency answers
-                # Simplified: use text overlap ratio (placeholder - proper embedding would be better)
-                Mi = compute_text_similarity(text, list(dep_answers.values()))
-
-            # Combined score (Equation 5)
+            Mi = compute_text_similarity(text, dep_answers_list) if dep_answers_list else 0.0
             final_score = alpha * Ri + beta * Mi
 
             if doc_id not in combined_results or final_score > combined_results[doc_id]["score"]:
@@ -1523,7 +1919,6 @@ async def retrieve_multihop(
                     "Mi": Mi,
                 }
 
-    # Sort by final score
     final_hits = [
         Hit(doc_id=data["doc_id"], text=data["text"], score=data["score"])
         for data in combined_results.values()
@@ -1586,19 +1981,16 @@ async def retrieve_adaptive(
     original_weight: float = 3.0,
     humanfactor: bool = False,
     humanfactor_weight: float = 2.0,
+    graph=None,
     logger=None
 ):
     """
-    Adaptive retrieval: LLM router selects strategy per query.
+    Adaptive retrieval: LLM classifies query type → routes to strategy.
 
-    Strategy selection:
-    1. Extract aspects via LLM
-    2. Classify based on:
-       - Aspect count (1 = baseline, 2+ = decomposition/multihop)
-       - Dependencies (sequential = multihop, parallel = decomposition)
-       - Query complexity
-    3. Execute selected strategy
-    4. Fallback: baseline on errors
+    Uses new extract_aspects format (type: simple/parallel/sequential):
+    - simple → baseline
+    - parallel → decomposition
+    - sequential → multihop (with optional graph cache)
 
     Args:
         store: Vector store
@@ -1608,6 +2000,9 @@ async def retrieve_adaptive(
         fusion: Fusion strategy
         search_mode: dense/sparse/hybrid
         original_weight: Weight for original query (decomposition)
+        humanfactor: Add reformulated query variant
+        humanfactor_weight: Weight for reformulated query
+        graph: Optional KnowledgeGraph for lazy caching (--lazygraph)
         logger: Optional logger
 
     Returns:
@@ -1619,61 +2014,56 @@ async def retrieve_adaptive(
     if logger:
         logger.log("\n" + "="*80)
         logger.log(f"[ADAPTIVE] Query: {query}")
+        logger.log(f"[ADAPTIVE] Graph: {'ON' if graph else 'OFF'}")
         logger.log("="*80)
 
     # =============================================================================
-    # PHASE 1: Extract Aspects for Classification
+    # PHASE 1: Extract & Classify
     # =============================================================================
 
     import time
     t0 = time.perf_counter()
 
-    aspects = await llm.extract_aspects(query)
+    raw = await llm.extract_aspects(query)
     extraction_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Fallback to baseline if extraction failed
-    if aspects is None:
+    if raw is None:
         debug["strategy"] = "baseline"
         debug["reasoning"] = "Aspect extraction failed"
+        debug["extraction_ms"] = extraction_ms
         if logger:
             logger.log(f"[ADAPTIVE] Strategy: baseline (extraction failed)")
         hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
         return hits, debug
 
-    aspect_count = len(aspects)
-
-    # Build simple execution order (all aspects in parallel)
-    execution_order = [list(aspects.keys())]
+    query_type = raw.get("type", "simple")
 
     # =============================================================================
-    # PHASE 2: Strategy Classification
+    # PHASE 2: Strategy Classification (based on type field)
     # =============================================================================
 
-    # Rule-based classification (simplified for flat aspects format)
-    # Note: Flat format from extract_aspects doesn't include dependency info,
-    # so we can only choose between baseline and decomposition
-
-    if aspect_count == 1:
-        # Simple query → baseline
-        strategy = "baseline"
-        reasoning = "Single aspect (simple query)"
-    elif aspect_count >= 2:
-        # Multiple independent aspects → decomposition
+    if query_type == "sequential" and len(raw.get("hops", [])) >= 2:
+        strategy = "multihop"
+        reasoning = f"Sequential query ({len(raw['hops'])} hops)"
+        aspect_count = len(raw["hops"])
+    elif query_type == "parallel" and len(raw.get("aspects", {})) >= 2:
         strategy = "decomposition"
-        reasoning = f"Multiple parallel aspects ({aspect_count})"
+        reasoning = f"Parallel aspects ({len(raw['aspects'])})"
+        aspect_count = len(raw["aspects"]) + 1  # +1 for original
     else:
-        # Default fallback
         strategy = "baseline"
-        reasoning = "Default fallback"
+        reasoning = f"Simple query (type={query_type})"
+        aspect_count = 1
 
     debug["strategy"] = strategy
     debug["reasoning"] = reasoning
     debug["aspect_count"] = aspect_count
+    debug["has_dependencies"] = query_type == "sequential"
     debug["extraction_ms"] = extraction_ms
 
     if logger:
         logger.log(f"\n[ADAPTIVE] Classification:")
-        logger.log(f"  Aspect count: {aspect_count}")
+        logger.log(f"  Type: {query_type}")
         logger.log(f"  → Strategy: {strategy} ({reasoning})")
 
     # =============================================================================
@@ -1683,21 +2073,32 @@ async def retrieve_adaptive(
     try:
         if strategy == "baseline":
             hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
+
         elif strategy == "decomposition":
-            hits, _ = await retrieve_decomposition(
+            hits, sub_debug = await retrieve_decomposition(
                 store, llm, query, top_k=top_k, fusion=fusion, search_mode=search_mode,
                 original_weight=original_weight,
                 humanfactor=humanfactor,
                 humanfactor_weight=humanfactor_weight,
                 logger=logger
             )
+            debug["decomp_debug"] = sub_debug
+
+        elif strategy == "multihop":
+            hits, sub_debug = await retrieve_multihop(
+                store, llm, query, top_k=top_k, fusion=fusion, search_mode=search_mode,
+                graph=graph,
+                logger=logger
+            )
+            debug["multihop_debug"] = sub_debug
+            debug["graph_hits"] = sub_debug.get("graph_hits", 0)
+            debug["graph_saves"] = sub_debug.get("graph_saves", 0)
+
         else:
-            # Unknown strategy → fallback to baseline
             debug["fallback"] = "unknown_strategy"
             hits, _ = await retrieve_baseline(store, query, top_k=top_k, fusion=fusion, search_mode=search_mode, logger=logger)
 
     except Exception as e:
-        # Error in strategy execution → fallback to baseline
         if logger:
             logger.log(f"\n[ADAPTIVE] ERROR in {strategy}: {e}")
             logger.log(f"[ADAPTIVE] Falling back to baseline")
@@ -1824,12 +2225,24 @@ async def main():
                     help="Add reformulated query variant to decomposition (helps with poorly written queries, typos, human factor)")
     ap.add_argument("--humanfactor-weight", type=float, default=2.0,
                     help="Weight for reformulated query in humanfactor mode (default: 2.0, between original and aspects)")
+    ap.add_argument("--lazygraph", action="store_true",
+                    help="Enable lazy knowledge graph: cache resolved multi-hop relationships in Qdrant. "
+                         "Graph builds up as side-effect of queries. Speeds up repeated/similar multi-hop queries.")
+    ap.add_argument("--llm", type=str, default="qwen",
+                    help="LLM backend to use: 'qwen' (default, Qwen3-30B via Caila) or "
+                         "'gemini' / 'gemini:gemini-2.5-flash' / 'gemini:gemini-2.5-pro' etc.")
+    ap.add_argument("--query-log", type=str, default=None,
+                    help="Per-query JSONL log with predicted/expected strategy for confusion matrix analysis. "
+                         "Only written in --variant adaptive. Example: logs/queries_hotpotqa.jsonl")
+    ap.add_argument("--generate", action="store_true",
+                    help="After retrieval, generate answer with LLM and compute F1/EM (QA datasets only)")
     args = ap.parse_args()
 
     # Set global entity boosting config
-    global _entity_boost_enabled, _entity_boost_weight
+    global _entity_boost_enabled, _entity_boost_weight, _llm_backend
     _entity_boost_enabled = args.entity_boost
     _entity_boost_weight = args.entity_boost_weight
+    _llm_backend = args.llm
 
     # Setup logger
     logger = None
@@ -1879,6 +2292,11 @@ async def main():
     print(f"[DATA] qrels: {len(qrels)}")
     print(f"[DATA] docs: {len(documents)}")
 
+    gold_answers: Dict[str, List[str]] = {}
+    if args.generate:
+        gold_answers = build_gold_answers(ds, set(qids.keys()))
+        print(f"[DATA] gold_answers: {len(gold_answers)} (for generation eval)")
+
     # Initialize vector store
     store = await init_vector_store(
         collection_name=args.collection,
@@ -1917,10 +2335,10 @@ async def main():
         use_env = input("Use API key from .env file? (y/n): ").strip().lower()
 
         if use_env == 'y':
-            llm = await init_llm_with_key()
+            llm = await init_llm_with_key(llm=args.llm)
         else:
             api_key = prompt_for_api_key()
-            llm = await init_llm_with_key(api_key)
+            llm = await init_llm_with_key(api_key, llm=args.llm)
 
         enhancer = await init_query_enhancer()
 
@@ -1933,10 +2351,29 @@ async def main():
         use_env = input("Use API key from .env file? (y/n): ").strip().lower()
 
         if use_env == 'y':
-            llm = await init_llm_with_key()
+            llm = await init_llm_with_key(llm=args.llm)
         else:
             api_key = prompt_for_api_key()
-            llm = await init_llm_with_key(api_key)
+            llm = await init_llm_with_key(api_key, llm=args.llm)
+
+    # =============================================================================
+    # LAZY KNOWLEDGE GRAPH
+    # =============================================================================
+
+    graph = None
+    if args.lazygraph and args.variant in ["multihop", "adaptive"]:
+        # Уникальная коллекция графа для каждого бенчмарка (привязана к --collection)
+        graph_collection = f"kg_{args.collection}"
+        print(f"\n[GRAPH] Initializing lazy knowledge graph (collection: {graph_collection})...")
+        graph = KnowledgeGraph(
+            qdrant_client=store.client,
+            embedding_model=store.embedding_model,
+            collection_name=graph_collection
+        )
+        graph_count = graph.count()
+        print(f"[GRAPH] Ready ({graph_count} existing triplets)")
+    elif args.lazygraph:
+        print("[GRAPH] --lazygraph ignored (only works with --variant multihop/adaptive)")
 
     # =============================================================================
     # PHASE 1: Query Processing (Sequential or Parallel)
@@ -2074,6 +2511,7 @@ async def main():
                 top_k=retrieval_k,
                 fusion=args.fusion,
                 search_mode=args.search_mode,
+                graph=graph,
                 logger=logger if idx <= 5 else None
             )
             multihop_time = (time.perf_counter() - multihop_start) * 1000
@@ -2082,6 +2520,8 @@ async def main():
             debug_info["dag_levels"] = dbg.get("dag_levels", 0)
             debug_info["extraction_ms"] = dbg.get("extraction_ms", 0.0)
             debug_info["fallback"] = dbg.get("fallback", None)
+            debug_info["graph_hits"] = dbg.get("graph_hits", 0)
+            debug_info["graph_saves"] = dbg.get("graph_saves", 0)
 
             if logger and idx <= 5:
                 logger.log(f"[TIMING] Multihop retrieval: {multihop_time:.1f}ms")
@@ -2104,6 +2544,7 @@ async def main():
                 original_weight=getattr(args, 'original_weight', 3.0),
                 humanfactor=getattr(args, 'humanfactor', False),
                 humanfactor_weight=getattr(args, 'humanfactor_weight', 2.0),
+                graph=graph,
                 logger=logger if idx <= 5 else None
             )
             adaptive_time = (time.perf_counter() - adaptive_start) * 1000
@@ -2114,6 +2555,8 @@ async def main():
             debug_info["has_dependencies"] = dbg.get("has_dependencies", False)
             debug_info["extraction_ms"] = dbg.get("extraction_ms", 0.0)
             debug_info["fallback"] = dbg.get("fallback", None)
+            debug_info["graph_hits"] = dbg.get("graph_hits", 0)
+            debug_info["graph_saves"] = dbg.get("graph_saves", 0)
 
             if logger and idx <= 5:
                 logger.log(f"[TIMING] Adaptive retrieval: {adaptive_time:.1f}ms")
@@ -2130,6 +2573,54 @@ async def main():
         if logger and idx <= 5:
             logger.log(f"[TIMING] ===== Total query time: {query_total_time:.1f}ms ({query_total_time/1000:.2f}s) =====\n")
 
+        # Generation + F1/EM evaluation (if --generate and gold answers available)
+        gen_record = {}
+        if args.generate and qid in gold_answers:
+            import app_state as _app_state
+            print(f"[GENERATE] Generating answer for query: {qtext[:80]}")
+            try:
+                generated = await call_with_retry(
+                    generate_rag_answer, qtext, hits, _app_state.llm_client,
+                    max_retries=3, llm_backend=_llm_backend
+                )
+                generated = generated.strip()
+                golds = gold_answers[qid]
+                em = compute_em(generated, golds)
+                f1 = compute_f1_score(generated, golds)
+                contains = compute_contains(generated, golds)
+                print(f"[ANSWER] generated: \"{generated}\"")
+                print(f"[EVAL] F1: {f1:.2f}  EM: {em:.2f}  Contains: {contains:.2f}  gold={golds[:2]}")
+                gen_record = {
+                    "generated": generated,
+                    "gold": golds,
+                    "em": em,
+                    "f1": f1,
+                    "contains": contains,
+                }
+            except Exception as e:
+                print(f"[GENERATE] Failed: {e}")
+
+        # Per-query log (adaptive or when --generate is used)
+        if (args.variant == "adaptive" or args.generate) and args.query_log:
+            expected = DATASET_EXPECTED_STRATEGY.get(args.dataset_id, "unknown")
+            predicted = debug_info.get("strategy", "simple")
+            query_record = {
+                "qid": qid,
+                "query": qtext,
+                "dataset": args.dataset_id,
+                "expected_strategy": expected,
+                "predicted_strategy": predicted,
+                "reasoning": debug_info.get("reasoning", ""),
+                "aspect_count": debug_info.get("aspect_count", 0),
+                "has_dependencies": debug_info.get("has_dependencies", False),
+                "query_time_ms": round(query_total_time, 1),
+                "hits_count": len(hits),
+                "relevant": bool(qrels.get(qid)),
+                **gen_record,
+            }
+            with open(args.query_log, "a", encoding="utf-8") as qf:
+                qf.write(json.dumps(query_record, ensure_ascii=False) + "\n")
+
         return qid, hits, query_total_time, debug_info
 
     # Run retrieval
@@ -2137,8 +2628,8 @@ async def main():
     retrieval_hits: Dict[str, List] = {}  # Store hits for batch reranking
     agentic_debug = {"avg_variants": 0.0, "avg_enh_ms": 0.0}
     decomp_debug = {"avg_aspects": 0.0, "avg_extract_ms": 0.0, "baseline_fallback_count": 0}
-    multihop_debug = {"avg_aspects": 0.0, "avg_dag_levels": 0.0, "avg_extract_ms": 0.0, "fallback_count": 0}
-    adaptive_debug = {"strategy_counts": defaultdict(int), "avg_aspect_count": 0.0, "avg_extract_ms": 0.0, "fallback_count": 0}
+    multihop_debug = {"avg_aspects": 0.0, "avg_dag_levels": 0.0, "avg_extract_ms": 0.0, "fallback_count": 0, "graph_hits": 0, "graph_saves": 0}
+    adaptive_debug = {"strategy_counts": defaultdict(int), "avg_aspect_count": 0.0, "avg_extract_ms": 0.0, "fallback_count": 0, "graph_hits": 0, "graph_saves": 0}
     dbg_count = 0
 
     print(f"\n[RETRIEVAL] Processing {len(queries)} queries...")
@@ -2174,6 +2665,8 @@ async def main():
                     multihop_debug["avg_aspects"] += debug_info.get("aspects_count", 0)
                     multihop_debug["avg_dag_levels"] += debug_info.get("dag_levels", 0)
                     multihop_debug["avg_extract_ms"] += debug_info.get("extraction_ms", 0)
+                    multihop_debug["graph_hits"] += debug_info.get("graph_hits", 0)
+                    multihop_debug["graph_saves"] += debug_info.get("graph_saves", 0)
                     dbg_count += 1
                     if debug_info.get("fallback"):
                         multihop_debug["fallback_count"] += 1
@@ -2182,6 +2675,8 @@ async def main():
                     adaptive_debug["strategy_counts"][strategy] += 1
                     adaptive_debug["avg_aspect_count"] += debug_info.get("aspect_count", 0)
                     adaptive_debug["avg_extract_ms"] += debug_info.get("extraction_ms", 0)
+                    adaptive_debug["graph_hits"] += debug_info.get("graph_hits", 0)
+                    adaptive_debug["graph_saves"] += debug_info.get("graph_saves", 0)
                     dbg_count += 1
                     if debug_info.get("fallback"):
                         adaptive_debug["fallback_count"] += 1
@@ -2240,6 +2735,8 @@ async def main():
                     multihop_debug["avg_aspects"] += debug_info.get("aspects_count", 0)
                     multihop_debug["avg_dag_levels"] += debug_info.get("dag_levels", 0)
                     multihop_debug["avg_extract_ms"] += debug_info.get("extraction_ms", 0)
+                    multihop_debug["graph_hits"] += debug_info.get("graph_hits", 0)
+                    multihop_debug["graph_saves"] += debug_info.get("graph_saves", 0)
                     dbg_count += 1
                     if debug_info.get("fallback"):
                         multihop_debug["fallback_count"] += 1
@@ -2248,6 +2745,8 @@ async def main():
                     adaptive_debug["strategy_counts"][strategy] += 1
                     adaptive_debug["avg_aspect_count"] += debug_info.get("aspect_count", 0)
                     adaptive_debug["avg_extract_ms"] += debug_info.get("extraction_ms", 0)
+                    adaptive_debug["graph_hits"] += debug_info.get("graph_hits", 0)
+                    adaptive_debug["graph_saves"] += debug_info.get("graph_saves", 0)
                     dbg_count += 1
                     if debug_info.get("fallback"):
                         adaptive_debug["fallback_count"] += 1
@@ -2289,8 +2788,27 @@ async def main():
 
     # Compute metrics
     metrics = compute_retrieval_metrics(retrieval_doc_ids, qrels, k_values=[1, 3, 5, 10])
+
+    # Aggregate generation metrics from query log if --generate was used
+    if args.generate and args.query_log and os.path.exists(args.query_log):
+        em_scores, f1_scores, contains_scores = [], [], []
+        with open(args.query_log, encoding="utf-8") as _qf:
+            for _line in _qf:
+                try:
+                    _rec = json.loads(_line)
+                    if "em" in _rec:
+                        em_scores.append(_rec["em"])
+                        f1_scores.append(_rec["f1"])
+                        contains_scores.append(_rec["contains"])
+                except Exception:
+                    pass
+        if em_scores:
+            metrics["gen_em"] = sum(em_scores) / len(em_scores)
+            metrics["gen_f1"] = sum(f1_scores) / len(f1_scores)
+            metrics["gen_contains"] = sum(contains_scores) / len(contains_scores)
+
     run_seconds = time.perf_counter() - t0
-    
+
     results_str = "\n" + "="*60 + "\n"
     results_str += f"[RESULTS] Retrieval Metrics ({args.variant})\n"
     results_str += "="*60 + "\n"
@@ -2301,33 +2819,104 @@ async def main():
     if logger:
         logger.log(results_str)
 
-    if args.results_out:
-        run_info = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "dataset_id": args.dataset_id,
-            "variant": args.variant,
-            "corpus": args.corpus,
-            "search_mode": args.search_mode,
-            "fusion": args.fusion,
-            "fusion_strategy": args.fusion_strategy if args.variant == "agentic" else None,
-            "original_weight": args.original_weight if args.variant in ["decomposition", "adaptive"] else None,
-            "top_k": args.top_k,
-            "max_variants": args.max_variants,
-            "include_original": args.include_original,
-            "max_queries": args.max_queries,
-            "max_docs": args.max_docs,
-            "reindex": args.reindex,
-            "batch_size": args.batch_size,
-            "queries_count": len(queries),
-            "docs_count": len(documents),
-            "qrels_count": len(qrels),
-            "runtime_sec": round(run_seconds, 3),
-            "metrics": metrics,
-        }
-        with open(args.results_out, "a", encoding="utf-8") as f:
-            f.write(json.dumps(run_info, ensure_ascii=False) + "\n")
-    
+    # =============================================================================
+    # SAVE RESULTS (JSONL)
+    # =============================================================================
+
+    results_file = args.results_out or "benchmark/Universal/results.jsonl"
+
+    # Build complete run info with ALL parameters
+    run_info = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # Dataset
+        "dataset_id": args.dataset_id,
+        "corpus": args.corpus,
+        "queries_count": len(queries),
+        "docs_count": len(documents),
+        "qrels_count": len(qrels),
+        "expected_strategy": DATASET_EXPECTED_STRATEGY.get(args.dataset_id, "unknown"),
+        # LLM
+        "llm": args.llm,
+        # Strategy
+        "variant": args.variant,
+        "search_mode": args.search_mode,
+        "fusion": args.fusion,
+        "top_k": args.top_k,
+        "collection": args.collection,
+        "embedding": args.embedding,
+        # Variant-specific params
+        "fusion_strategy": args.fusion_strategy if args.variant == "agentic" else None,
+        "max_variants": args.max_variants if args.variant == "agentic" else None,
+        "include_original": args.include_original if args.variant == "agentic" else None,
+        "original_weight": args.original_weight if args.variant in ["decomposition", "adaptive"] else None,
+        "humanfactor": args.humanfactor if args.variant in ["decomposition", "adaptive"] else None,
+        "humanfactor_weight": args.humanfactor_weight if args.humanfactor else None,
+        # Reranking
+        "rerank": args.rerank,
+        "rerank_top_k": args.rerank_top_k if args.rerank else None,
+        "batch_rerank": args.batch_rerank if args.rerank else None,
+        "adaptive_fallback": args.adaptive_fallback,
+        # Entity
+        "enable_ner": args.enable_ner,
+        "entity_boost": args.entity_boost,
+        "entity_boost_weight": args.entity_boost_weight if args.entity_boost else None,
+        # Graph
+        "lazygraph": args.lazygraph,
+        # Index
+        "reindex": args.reindex,
+        "batch_size": args.batch_size,
+        "max_queries": args.max_queries,
+        "max_docs": args.max_docs,
+        "max_workers": args.max_workers,
+        # Timing
+        "runtime_sec": round(run_seconds, 3),
+        # Metrics
+        "metrics": metrics,
+    }
+
+    # Add variant-specific debug stats
     if dbg_count:
+        if args.variant == "agentic":
+            run_info["debug"] = {
+                "avg_variants": round(agentic_debug["avg_variants"] / dbg_count, 2) if dbg_count else 0,
+                "avg_enhance_ms": round(agentic_debug["avg_enh_ms"] / dbg_count, 1) if dbg_count else 0,
+            }
+        elif args.variant == "decomposition":
+            run_info["debug"] = {
+                "avg_aspects": round(decomp_debug["avg_aspects"] / dbg_count, 2),
+                "avg_extract_ms": round(decomp_debug["avg_extract_ms"] / dbg_count, 1),
+                "baseline_fallback_count": decomp_debug["baseline_fallback_count"],
+                "baseline_fallback_rate": round(decomp_debug["baseline_fallback_count"] / dbg_count * 100, 1),
+            }
+        elif args.variant == "multihop":
+            run_info["debug"] = {
+                "avg_aspects": round(multihop_debug["avg_aspects"] / dbg_count, 2),
+                "avg_dag_levels": round(multihop_debug["avg_dag_levels"] / dbg_count, 2),
+                "avg_extract_ms": round(multihop_debug["avg_extract_ms"] / dbg_count, 1),
+                "fallback_count": multihop_debug["fallback_count"],
+                "graph_hits": multihop_debug["graph_hits"],
+                "graph_saves": multihop_debug["graph_saves"],
+                "graph_total": graph.count() if graph else 0,
+            }
+        elif args.variant == "adaptive":
+            run_info["debug"] = {
+                "strategy_distribution": dict(adaptive_debug["strategy_counts"]),
+                "avg_aspect_count": round(adaptive_debug["avg_aspect_count"] / dbg_count, 2),
+                "avg_extract_ms": round(adaptive_debug["avg_extract_ms"] / dbg_count, 1),
+                "fallback_count": adaptive_debug["fallback_count"],
+                "graph_hits": adaptive_debug["graph_hits"],
+                "graph_saves": adaptive_debug["graph_saves"],
+                "graph_total": graph.count() if graph else 0,
+            }
+
+    # Remove None values for cleaner JSONL
+    run_info = {k: v for k, v in run_info.items() if v is not None}
+
+    with open(results_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(run_info, ensure_ascii=False) + "\n")
+    print(f"\n[RESULTS] Saved to {results_file}")
+    
+    if dbg_count and args.variant == "agentic":
         agentic_debug["avg_variants"] /= dbg_count
         agentic_debug["avg_enh_ms"] /= dbg_count
         debug_str = f"\n[AGENTIC] avg_variants: {agentic_debug['avg_variants']:.2f}\n"
@@ -2354,6 +2943,11 @@ async def main():
         fallback_count = multihop_debug.get("fallback_count", 0)
         fallback_rate = (fallback_count / dbg_count) * 100
         debug_str += f"[MULTIHOP] fallback_to_baseline: {fallback_count}/{dbg_count} ({fallback_rate:.1f}%)\n"
+        if graph:
+            debug_str += f"[MULTIHOP] graph_cache_hits: {multihop_debug['graph_hits']}\n"
+            debug_str += f"[MULTIHOP] graph_saves: {multihop_debug['graph_saves']}\n"
+            graph_count = graph.count()
+            debug_str += f"[MULTIHOP] graph_total_triplets: {graph_count}\n"
         print(debug_str)
         if logger:
             logger.log(debug_str)
@@ -2370,6 +2964,11 @@ async def main():
         fallback_count = adaptive_debug.get("fallback_count", 0)
         fallback_rate = (fallback_count / dbg_count) * 100
         debug_str += f"[ADAPTIVE] fallback_errors: {fallback_count}/{dbg_count} ({fallback_rate:.1f}%)\n"
+        if graph:
+            debug_str += f"[ADAPTIVE] graph_cache_hits: {adaptive_debug['graph_hits']}\n"
+            debug_str += f"[ADAPTIVE] graph_saves: {adaptive_debug['graph_saves']}\n"
+            graph_count = graph.count()
+            debug_str += f"[ADAPTIVE] graph_total_triplets: {graph_count}\n"
         print(debug_str)
         if logger:
             logger.log(debug_str)

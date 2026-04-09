@@ -1,12 +1,15 @@
 import app_state
 import prompts_config
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from fastapi import UploadFile
 import tempfile
 import os
 import io
 import time
+import asyncio
 from services.document_types import is_supported_document, temp_suffix_for
+from services.fusion import weighted_rrf_fusion, aspect_fusion, multihop_merge
+from services.query_enhancer import QueryEnhancerService
 from tg_bot import custom_emoji as ce
 
 
@@ -229,36 +232,26 @@ class RAGService:
                     print(f"[FILTERED LIST] No filters found - using RAG")
 
 
-            search_queries = app_state.query_enhancer.build_search_queries(enhanced)
+            # Adaptive search: анализ сложности + выбор стратегии
+            search_start = time.perf_counter()
+            search_results, strategy, analysis_time = await self._search_adaptive(
+                query=query,
+                enhanced=enhanced,
+                top_k=top_k,
+            )
+            search_time = time.perf_counter() - search_start
         else:
-            search_queries = [query]
-
-        search_start = time.perf_counter()
-        all_results = []
-        seen_texts = set()
-
-        for idx, search_query in enumerate(search_queries, 1):
-            if len(search_queries) > 1:
-                print(f"[MULTI-QUERY SEARCH] Query {idx}/{len(search_queries)}: {search_query}")
-            results = await app_state.vector_store.search(search_query, top_k=top_k)
-
-            for result in results:
-                text_key = result['text'][:100]
-                if text_key not in seen_texts:
-                    seen_texts.add(text_key)
-                    result['search_query'] = search_query
-                    all_results.append(result)
-
-        search_results = sorted(all_results, key=lambda x: x['score'], reverse=True)[:top_k]
-        search_time = time.perf_counter() - search_start
+            search_start = time.perf_counter()
+            search_results = await app_state.vector_store.search(query, top_k=top_k)
+            search_time = time.perf_counter() - search_start
+            strategy = "baseline"
+            analysis_time = 0.0
 
         print(f"\n{'='*80}")
         print(f"[RAG CHAT] User ID: {user_id}")
         print(f"[RAG CHAT] Original Query: {query}")
-        print(f"[RAG CHAT] Query Enhancement: {'ENABLED' if self.enable_query_enhancement else 'DISABLED'}")
-        if self.enable_query_enhancement:
-            print(f"[RAG CHAT] Searched {len(search_queries)} query variations")
-        print(f"[RAG CHAT] Found {len(search_results)} unique results (after deduplication)")
+        print(f"[RAG CHAT] Strategy: {strategy}")
+        print(f"[RAG CHAT] Found {len(search_results)} results")
 
         if search_results and 'search_type' in search_results[0]:
             search_type_stats = {}
@@ -278,8 +271,10 @@ class RAGService:
 
                 print(f"  Source: {doc.get('metadata', {}).get('source', 'unknown')}")
                 print(f"  Chunk ID: {doc.get('metadata', {}).get('chunk_id', 'N/A')}")
-                if self.enable_query_enhancement:
-                    print(f"  Found by query: {doc.get('search_query', 'N/A')}")
+                if doc.get('covered_aspects'):
+                    print(f"  Covered aspects: {doc['covered_aspects']}")
+                if doc.get('hop_index') is not None:
+                    print(f"  Hop index: {doc['hop_index']}")
                 print(f"  Text preview: {doc.get('text', '')[:150]}...")
         print(f"{'='*80}\n")
 
@@ -294,17 +289,23 @@ class RAGService:
             print(
                 "[timing] rag_chat: "
                 f"enhancement={enhancement_time:.3f}s "
+                f"analysis={analysis_time:.3f}s "
                 f"search={search_time:.3f}s "
                 f"llm={llm_time:.3f}s "
-                f"total={total_time:.3f}s (no_results)"
+                f"total={total_time:.3f}s "
+                f"strategy={strategy} (no_results)"
             )
             return {"answer": answer, "sources": []}
 
         filter_start = time.perf_counter()
-        relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
+        # Для RRF-based стратегий порог не применяем (scores несравнимы с cosine)
+        if strategy in ("decomposition", "multihop", "reformulation"):
+            relevant_results = search_results
+        else:
+            relevant_results = [doc for doc in search_results if doc['score'] >= self.min_relevance]
         filter_time = time.perf_counter() - filter_start
 
-        print(f"[RAG CHAT] Filtered: {len(relevant_results)}/{len(search_results)} results above threshold {self.min_relevance}")
+        print(f"[RAG CHAT] Filtered: {len(relevant_results)}/{len(search_results)} results (strategy={strategy})")
 
         context_time = 0.0
         if relevant_results:
@@ -342,15 +343,18 @@ class RAGService:
         print(
             "[timing] rag_chat: "
             f"enhancement={enhancement_time:.3f}s "
+            f"analysis={analysis_time:.3f}s "
             f"search={search_time:.3f}s "
             f"filter={filter_time:.3f}s "
             f"context={context_time:.3f}s "
             f"llm={llm_time:.3f}s "
-            f"total={total_time:.3f}s"
+            f"total={total_time:.3f}s "
+            f"strategy={strategy}"
         )
         return {
             "answer": answer,
-            "sources": sources
+            "sources": sources,
+            "strategy": strategy
         }
 
     async def delete_document(self, document_id: str, filename: str) -> None:
@@ -405,6 +409,337 @@ class RAGService:
 
     async def delete_collection(self) -> None:
         await app_state.vector_store.delete_collection()
+
+    # =========================================================================
+    # ADAPTIVE SEARCH STRATEGIES
+    # =========================================================================
+
+    async def _extract_and_save_to_graph(
+        self,
+        query: str,
+        docs: List[Dict],
+        source_strategy: str = "",
+    ) -> None:
+        """
+        Фоновая задача: извлекает триплеты из документов и сохраняет в граф.
+
+        Вызывается через asyncio.create_task() — fire and forget.
+        Если упадёт — не страшно, граф просто не пополнится этим запросом.
+        """
+        graph = app_state.knowledge_graph
+        if not graph or not graph._initialized:
+            return
+        if not docs:
+            return
+
+        try:
+            # Берём текст топ-5 документов (не перегружаем контекст LLM)
+            context_parts = [doc["text"][:300] for doc in docs[:5]]
+            context = "\n---\n".join(context_parts)
+
+            triplets = await app_state.llm_client.extract_triplets(query, context)
+            if not triplets:
+                return
+
+            for t in triplets:
+                t["source_query"] = query
+                t["source_strategy"] = source_strategy
+
+            await graph.save_triplets_batch(triplets)
+
+        except Exception as e:
+            print(f"[GRAPH BACKGROUND] Error: {e}")
+
+    async def _search_adaptive(
+        self,
+        query: str,
+        enhanced: Dict,
+        top_k: int,
+    ) -> Tuple[List[Dict], str, float]:
+        """
+        Адаптивный поиск: анализирует сложность запроса и выбирает стратегию.
+
+        Returns:
+            (search_results, strategy_name, analysis_time)
+        """
+        analysis_start = time.perf_counter()
+
+        # Анализ сложности через LLM
+        complexity = await app_state.query_enhancer.analyze_complexity(query)
+        analysis_time = time.perf_counter() - analysis_start
+
+        # Определение стратегии
+        strategy = app_state.query_enhancer.detect_strategy(enhanced, complexity)
+
+        print(f"\n[ADAPTIVE] Strategy: {strategy} (analysis: {analysis_time:.3f}s)")
+
+        if strategy == QueryEnhancerService.STRATEGY_MULTIHOP:
+            results = await self._search_multihop(query, complexity, top_k)
+        elif strategy == QueryEnhancerService.STRATEGY_DECOMPOSITION:
+            results = await self._search_decomposition(query, complexity, top_k)
+        elif strategy == QueryEnhancerService.STRATEGY_REFORMULATION:
+            search_queries = app_state.query_enhancer.build_search_queries(enhanced)
+            results = await self._search_reformulation(search_queries, top_k, query=query)
+        else:
+            results = await self._search_baseline(query, top_k)
+
+        return results, strategy, analysis_time
+
+    async def _search_baseline(self, query: str, top_k: int) -> List[Dict]:
+        """
+        Baseline стратегия: простой поиск + graph lookup для enrichment.
+        """
+        # Graph lookup перед поиском
+        graph_docs = []
+        graph = app_state.knowledge_graph
+        if graph and graph._initialized:
+            graph_docs = await graph.lookup(query, min_score=0.75)
+
+        results = await app_state.vector_store.search(query, top_k=top_k)
+
+        # Фоновое сохранение в граф
+        if results:
+            asyncio.create_task(
+                self._extract_and_save_to_graph(query, results, source_strategy="baseline")
+            )
+
+        # Graph hits добавляем в начало — они уже верифицированы
+        return graph_docs + results
+
+    async def _search_reformulation(
+        self,
+        search_queries: List[str],
+        top_k: int,
+        query: str = "",
+    ) -> List[Dict]:
+        """
+        Reformulation стратегия: поиск по нескольким вариантам запроса + weighted RRF.
+        """
+        # Graph lookup по оригинальному запросу
+        graph_docs = []
+        graph = app_state.knowledge_graph
+        if graph and graph._initialized and query:
+            graph_docs = await graph.lookup(query, min_score=0.75)
+
+        variant_results = []
+
+        for idx, search_query in enumerate(search_queries, 1):
+            if len(search_queries) > 1:
+                print(f"[REFORMULATION] Query {idx}/{len(search_queries)}: {search_query}")
+            results = await app_state.vector_store.search(search_query, top_k=top_k)
+            variant_results.append(results)
+
+        if len(variant_results) <= 1:
+            fused = variant_results[0] if variant_results else []
+        else:
+            fused = weighted_rrf_fusion(
+                variant_results,
+                top_k=top_k,
+                original_weight=3.0,
+                variant_weight=1.0,
+            )
+
+        # Фоновое сохранение
+        if fused:
+            asyncio.create_task(
+                self._extract_and_save_to_graph(query or search_queries[0], fused, source_strategy="reformulation")
+            )
+
+        return graph_docs + fused
+
+    async def _search_decomposition(
+        self,
+        query: str,
+        complexity: Dict,
+        top_k: int,
+    ) -> List[Dict]:
+        """
+        Decomposition стратегия: параллельный поиск по аспектам + aspect_fusion.
+        """
+        aspects = complexity.get("aspects", {})
+        if not aspects:
+            return await self._search_baseline(query, top_k)
+
+        # Graph lookup перед поиском
+        graph_docs = []
+        graph = app_state.knowledge_graph
+        if graph and graph._initialized:
+            graph_docs = await graph.lookup(query, min_score=0.75)
+
+        print(f"[DECOMPOSITION] Searching {len(aspects)} aspects in parallel")
+
+        async def search_aspect(name: str, aspect_query: str) -> Tuple[str, List[Dict]]:
+            print(f"  → aspect '{name}': {aspect_query}")
+            results = await app_state.vector_store.search(aspect_query, top_k=top_k)
+            return name, results
+
+        tasks = [search_aspect(name, aq) for name, aq in aspects.items()]
+        original_task = app_state.vector_store.search(query, top_k=top_k)
+
+        original_results, *aspect_pairs = await asyncio.gather(
+            original_task, *tasks
+        )
+
+        aspect_results = {name: results for name, results in aspect_pairs}
+
+        print(f"[DECOMPOSITION] Original: {len(original_results)} results")
+        for name, results in aspect_results.items():
+            print(f"[DECOMPOSITION] Aspect '{name}': {len(results)} results")
+
+        fused = aspect_fusion(
+            original_results=original_results,
+            aspect_results=aspect_results,
+            top_k=top_k,
+            original_weight=3.0,
+            aspect_weight=1.0,
+            coverage_bonus=0.5,
+        )
+
+        # Фоновое сохранение
+        if fused:
+            asyncio.create_task(
+                self._extract_and_save_to_graph(query, fused, source_strategy="decomposition")
+            )
+
+        return graph_docs + fused
+
+    async def _search_multihop(
+        self,
+        query: str,
+        complexity: Dict,
+        top_k: int,
+    ) -> List[Dict]:
+        """
+        Multi-hop стратегия: последовательные хопы с graph cache.
+
+        1. Перед каждым хопом — проверяем граф (cache hit = skip LLM)
+        2. Если cache miss — search + LLM extraction
+        3. После extraction — сохраняем в граф для будущих запросов
+        """
+        hops = complexity.get("hops", [])
+        if not hops:
+            return await app_state.vector_store.search(query, top_k=top_k)
+
+        graph = app_state.knowledge_graph
+        print(f"[MULTIHOP] Executing {len(hops)} sequential hops (graph={'ON' if graph and graph._initialized else 'OFF'})")
+
+        hop_results = []
+        prev_context = ""
+        resolved_hops = []  # Для сохранения в граф
+
+        for hop_idx, hop in enumerate(hops, 1):
+            hop_query_template = hop.get("query", "")
+            extract_hint = hop.get("extract", "")
+
+            # Подставляем контекст из предыдущего хопа
+            hop_query = hop_query_template
+            if prev_context and "{prev}" in hop_query:
+                hop_query = hop_query.replace("{prev}", prev_context)
+
+            print(f"  → Hop {hop_idx}: {hop_query}")
+
+            # === GRAPH LOOKUP: пробуем resolve через кэш ===
+            graph_hit = None
+            if graph and graph._initialized and hop_idx < len(hops):
+                graph_hit = await graph.resolve_hop(
+                    hop_query=hop_query,
+                    extract_hint=extract_hint,
+                    min_score=0.75,
+                )
+
+            results = await app_state.vector_store.search(hop_query, top_k=top_k)
+            hop_results.append(results)
+            print(f"    found: {len(results)} results")
+
+            # Извлекаем контекст для следующего хопа
+            if hop_idx < len(hops):
+                if graph_hit:
+                    # Cache hit — используем значение из графа
+                    prev_context = graph_hit
+                    print(f"    [GRAPH HIT] Using cached: {prev_context[:100]}")
+                elif results:
+                    # Cache miss — извлекаем через LLM
+                    prev_context = await self._extract_hop_context(
+                        results=results[:3],
+                        extract_hint=extract_hint,
+                        hop_query=hop_query,
+                    )
+                    print(f"    [LLM EXTRACT] {prev_context[:100]}...")
+
+                    # Сохраняем для графа
+                    if prev_context and len(prev_context) < 200:
+                        resolved_hops.append({
+                            "subject": hop_query,
+                            "predicate": extract_hint or "resolves_to",
+                            "object": prev_context,
+                            "source_query": query,
+                        })
+
+        # === GRAPH SAVE: сохраняем resolved hops (синхронно, т.к. уже в конце) ===
+        if resolved_hops and graph and graph._initialized:
+            saved = await graph.save_triplets_batch(resolved_hops)
+            if saved:
+                print(f"[MULTIHOP] Saved {saved} hop triplets to graph")
+
+        merged = multihop_merge(
+            hop_results=hop_results,
+            top_k=top_k,
+            later_hop_boost=1.5,
+        )
+
+        # Фоновое извлечение дополнительных триплетов из всех документов
+        all_docs = [doc for hop in hop_results for doc in hop]
+        if all_docs and graph and graph._initialized:
+            asyncio.create_task(
+                self._extract_and_save_to_graph(query, all_docs, source_strategy="multihop")
+            )
+
+        return merged
+
+    async def _extract_hop_context(
+        self,
+        results: List[Dict],
+        extract_hint: str,
+        hop_query: str,
+    ) -> str:
+        """
+        Извлекает ключевую информацию из результатов хопа для следующего хопа.
+
+        Использует LLM для точного извлечения, с fallback на top-1 текст.
+        """
+        if not results:
+            return ""
+
+        # Собираем текст из top результатов
+        texts = [doc['text'][:300] for doc in results[:3]]
+        context_text = "\n---\n".join(texts)
+
+        # Просим LLM извлечь нужную информацию
+        extraction_prompt = f"""Extract the specific information from the search results below.
+
+SEARCH RESULTS:
+{context_text}
+
+WHAT TO EXTRACT: {extract_hint}
+ORIGINAL QUESTION: {hop_query}
+
+Return ONLY the extracted value (name, term, fact). Keep it short (1-2 sentences max). No explanations."""
+
+        try:
+            extracted = await app_state.llm_client.simple_query(extraction_prompt)
+            extracted = extracted.strip()
+
+            # Очистка от think-тегов (Qwen3)
+            if "<think>" in extracted and "</think>" in extracted:
+                extracted = extracted.split("</think>", 1)[1].strip()
+
+            if extracted and len(extracted) < 200:
+                return extracted
+        except Exception as e:
+            print(f"[MULTIHOP] Extraction failed: {e}")
+
+        # Fallback: берём первые N символов из top-1 результата
+        return results[0]['text'][:150]
 
     def _build_context(self, relevant_results: List[Dict]) -> str:
         context_parts = []

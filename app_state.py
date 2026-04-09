@@ -9,6 +9,7 @@ document_indexer = None
 minio_storage = None
 query_enhancer = None
 tour_catalog = None
+knowledge_graph = None
 
 services_ready = False
 

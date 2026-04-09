@@ -270,60 +270,98 @@ def build_query_enhancement_prompt(query: str) -> str:
 # ASPECT EXTRACTION PROMPT (для Query Decomposition)
 # =============================================================================
 
-ASPECT_EXTRACTION_PROMPT_TEMPLATE = """You are a query analysis expert. Your task is to decide if a query needs decomposition and extract independent searchable aspects.
+ASPECT_EXTRACTION_PROMPT_TEMPLATE = """You are a query analysis expert. Classify the query type and extract aspects if needed.
+
+QUERY TYPES:
+- "simple" → Single concept, no decomposition needed
+- "parallel" → Multiple INDEPENDENT aspects that can be searched separately and merged
+- "sequential" → Multi-hop chain where each step DEPENDS on the previous result
 
 CRITICAL RULES:
-1. ALWAYS include "original" key with the full original query
-2. Simple query (1 concept) → Return ONLY {{"original": "query"}} (triggers baseline)
-3. Complex query (2+ concepts) → Add 1-4 additional aspects (decomposition mode)
-4. Each aspect should be INDEPENDENT and SEARCHABLE
-5. Aspects should NOT semantically overlap
-6. Max 5 total aspects (including original)
+1. ALWAYS include "type" and "original" fields
+2. Simple query → {{"type": "simple", "original": "query"}}
+3. Parallel query → {{"type": "parallel", "original": "query", "aspects": {{...}}}}
+4. Sequential query → {{"type": "sequential", "original": "query", "hops": [...]}}
+5. For parallel: aspects must be INDEPENDENT and SEARCHABLE, max 4 aspects
+6. For sequential: hops are ORDERED, each hop may use "{{prev}}" placeholder for previous hop's result
+7. Keep aspect/hop queries concise and search-optimized
 
 EXAMPLES:
 
-Simple query (NO decomposition needed):
+Simple (1 concept):
 Input: "туры в Турцию"
 Output:
 {{
+  "type": "simple",
   "original": "туры в Турцию"
 }}
-→ Only 1 aspect → System will use BASELINE retrieval
 
-Complex query (decomposition needed):
+Parallel (independent aspects):
 Input: "Пляжный отель Турция с детьми и аквапарком"
 Output:
 {{
+  "type": "parallel",
   "original": "Пляжный отель Турция с детьми и аквапарком",
-  "location": "пляжные отели Турция",
-  "family": "детская инфраструктура отель",
-  "facilities": "аквапарк отель"
+  "aspects": {{
+    "location": "пляжные отели Турция",
+    "family": "детская инфраструктура отель",
+    "facilities": "аквапарк отель"
+  }}
 }}
-→ 4 aspects → System will use DECOMPOSITION with weighted fusion
 
-Multi-aspect query:
+Parallel (multiple independent criteria):
 Input: "Retirement investment with low risk and high liquidity"
 Output:
 {{
+  "type": "parallel",
   "original": "Retirement investment with low risk and high liquidity",
-  "goal": "retirement investment strategy",
-  "risk": "low risk portfolio",
-  "liquidity": "high liquidity assets"
+  "aspects": {{
+    "goal": "retirement investment strategy",
+    "risk": "low risk portfolio",
+    "liquidity": "high liquidity assets"
+  }}
 }}
 
-Multi-hop query:
+Sequential (multi-hop, each step depends on previous):
 Input: "Who is the spouse of the director of Inception?"
 Output:
 {{
+  "type": "sequential",
   "original": "Who is the spouse of the director of Inception?",
-  "movie_director": "director of Inception",
-  "director_spouse": "Christopher Nolan spouse"
+  "hops": [
+    {{"query": "director of Inception", "extract": "director name"}},
+    {{"query": "{{prev}} spouse wife husband", "extract": "spouse name"}}
+  ]
+}}
+
+Sequential (chained lookup):
+Input: "Какие экскурсии есть в городе, где находится отель из тура Золотая Анталья?"
+Output:
+{{
+  "type": "sequential",
+  "original": "Какие экскурсии есть в городе, где находится отель из тура Золотая Анталья?",
+  "hops": [
+    {{"query": "тур Золотая Анталья отель город", "extract": "город отеля"}},
+    {{"query": "экскурсии {{prev}}", "extract": "список экскурсий"}}
+  ]
+}}
+
+Sequential (comparative):
+Input: "Is the country with the highest GDP in Europe also the most populated?"
+Output:
+{{
+  "type": "sequential",
+  "original": "Is the country with the highest GDP in Europe also the most populated?",
+  "hops": [
+    {{"query": "highest GDP country Europe", "extract": "country name"}},
+    {{"query": "most populated country Europe vs {{prev}} population", "extract": "population comparison"}}
+  ]
 }}
 
 Now analyze:
 {query}
 
-Return ONLY JSON dict with "original" key ALWAYS present. Nothing else."""
+Return ONLY JSON. Nothing else."""
 
 
 def build_aspect_extraction_prompt(query: str) -> str:
@@ -337,6 +375,51 @@ def build_aspect_extraction_prompt(query: str) -> str:
         Готовый промпт для LLM
     """
     return ASPECT_EXTRACTION_PROMPT_TEMPLATE.format(query=query)
+
+
+# =============================================================================
+# TRIPLET EXTRACTION PROMPT (для фонового обогащения Knowledge Graph)
+# =============================================================================
+
+TRIPLET_EXTRACTION_PROMPT_TEMPLATE = """Extract factual entity relationships from the search results below.
+
+QUERY: {query}
+
+SEARCH RESULTS:
+{context}
+
+Your task: find named entity relationships (triplets) explicitly stated in the documents.
+
+Return JSON:
+{{
+  "triplets": [
+    {{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.0}}
+  ]
+}}
+
+Rules:
+- subject/object: specific named entities (people, places, organizations, products, tours)
+- predicate: short relation (located_in, directed_by, part_of, has_feature, spouse_of, includes, costs, departs_from)
+- confidence: 0.9 = explicitly stated, 0.75 = clearly implied, skip if uncertain (<0.7)
+- Max 5 most important triplets
+- Only facts FROM THE DOCUMENTS, not from your knowledge
+- If no clear entity relations found, return {{"triplets": []}}
+
+Return ONLY JSON:"""
+
+
+def build_triplet_extraction_prompt(query: str, context: str) -> str:
+    """
+    Строит промпт для извлечения триплетов из документов.
+
+    Args:
+        query: исходный запрос
+        context: текст документов (до 1500 символов)
+
+    Returns:
+        Готовый промпт для LLM
+    """
+    return TRIPLET_EXTRACTION_PROMPT_TEMPLATE.format(query=query, context=context)
 
 
 # =============================================================================

@@ -10,6 +10,7 @@ from services.startup_sync import sync_on_startup
 from services.chat_cleanup import ChatCleanupWorker
 from services.query_enhancer import QueryEnhancerService
 from services.tour_catalog import TourCatalogService
+from services.knowledge_graph import KnowledgeGraph
 import app_state
 import os
 import asyncio
@@ -43,6 +44,15 @@ async def lifespan(app: FastAPI):
         print("Vector Store готов (Hybrid Search: Dense + Sparse)")
     else:
         print("Vector Store готов (только Dense vectors)")
+
+    print("\n2.5/8 Инициализация Knowledge Graph...")
+    knowledge_graph = KnowledgeGraph(
+        qdrant_client=vector_store.client,
+        embedding_model=vector_store.embedding_model
+    )
+    app_state.knowledge_graph = knowledge_graph
+    await knowledge_graph.initialize()
+    print("Knowledge Graph готов")
 
     print("\n3/8 Инициализация MinIO хранилища...")
     minio_storage = MinioStorageService(
