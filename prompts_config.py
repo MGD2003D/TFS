@@ -1,83 +1,88 @@
 """
-Конфигурация промптов для RAG системы.
+Конфигурация промптов для почтового ассистента.
 
 Содержит промпты для:
 - System prompt LLM
-- RAG query prompts
-- Query enhancement prompts
+- RAG query prompts (с атрибуцией по письму)
+- Query enhancement prompts (email-специфичные интенты)
+- Промпты адаптивного поиска (decomposition, multihop, complexity)
 """
 
 # =============================================================================
-# SYSTEM PROMPT для LLM клиента
+# SYSTEM PROMPT
 # =============================================================================
 
-SYSTEM_PROMPT = """Ты ИИ-ассистент администрации Невского района Санкт-Петербурга.
+SYSTEM_PROMPT = """Ты ИИ-ассистент для навигации по почтовой переписке.
 
-Твоя задача — помогать жителям Санкт-Петербурга находить информацию по вопросам городского управления, жилищным вопросам, социальным услугам и другим темам, связанным с деятельностью администрации. Если вопрос касается конкретно Невского района — учитывай это в ответе.
+Твоя задача — помогать пользователю находить информацию в его письмах: \
+даты, договорённости, участников переписки, решения, задачи и сроки.
 
 КРИТИЧЕСКИЕ ПРАВИЛА:
-1. СТРОГО используй ТОЛЬКО информацию из предоставленных документов
-2. НЕ ПРИДУМЫВАЙ факты, цифры или детали — только то, что есть в документах
-3. Если информации недостаточно или её нет — честно скажи об этом
-4. Отвечай чётко, структурированно и по существу
-5. Если вопрос выходит за рамки предоставленной информации — укажи это
-6. Отвечай с учётом специфики Санкт-Петербурга; если вопрос касается Невского района — явно отметь это
-
-Твоя цель — предоставить точную и полезную информацию жителям от лица администрации Невского района Санкт-Петербурга."""
+1. Используй ТОЛЬКО информацию из предоставленных писем
+2. НЕ придумывай факты — только то, что есть в переписке
+3. Всегда указывай источник: дату письма и отправителя
+4. Если информации нет — честно скажи об этом
+5. Отвечай чётко и по существу"""
 
 
 # =============================================================================
-# RAG QUERY PROMPT (используется в _build_rag_prompt)
+# RAG QUERY PROMPT
 # =============================================================================
 
-def build_referral_prompt(context: str, query: str) -> str:
-    """
-    Промпт для случая, когда прямого ответа нет, но в тексте могут быть
-    контакты/адреса/организации — куда пользователь может обратиться.
-    """
-    return f"""Тебе предоставлены фрагменты документов, связанных с вопросом, но прямого ответа не содержащих.
-
-=== ФРАГМЕНТЫ ДОКУМЕНТОВ ===
-{context}
-
-=== ВОПРОС ПОЛЬЗОВАТЕЛЯ ===
-{query}
-
-=== ИНСТРУКЦИЯ ===
-Прямого ответа на вопрос в документах не найдено. Изучи фрагменты и:
-1. Если в тексте есть информация о том, куда обратиться за ответом (организации, адреса, телефоны, сайты, часы работы) — извлеки и сообщи пользователю.
-2. Если такой информации тоже нет — скажи, что ответа найти не удалось, и порекомендуй обратиться в администрацию Невского района напрямую.
-НЕ придумывай контакты и адреса — только то, что есть в тексте.
-
-Твой ответ:"""
+def _format_source_label(metadata: dict) -> str:
+    """Строит метку источника из метаданных чанка."""
+    parts = []
+    if metadata.get("email_date"):
+        parts.append(metadata["email_date"])
+    if metadata.get("email_from"):
+        parts.append(f"от {metadata['email_from']}")
+    if metadata.get("email_subject"):
+        parts.append(f"тема: «{metadata['email_subject']}»")
+    if not parts and metadata.get("source"):
+        parts.append(metadata["source"])
+    return ", ".join(parts) if parts else "письмо"
 
 
 def build_rag_prompt(context: str, query: str) -> str:
     """
-    Строит промпт для RAG запроса с контекстом из документов.
-
-    Args:
-        context: Релевантная информация из документов
-        query: Вопрос пользователя
-
-    Returns:
-        Готовый промпт для LLM
+    Промпт для RAG-ответа с атрибуцией по письму.
+    context уже содержит шапки писем (Дата/От/Тема) из индексера.
     """
-    return f"""Используй информацию из документов ниже для ответа на вопрос пользователя.
+    return f"""Используй фрагменты писем ниже для ответа на вопрос.
 
-=== ДОКУМЕНТЫ ===
+=== ПИСЬМА ===
 {context}
 
 === ВОПРОС ===
 {query}
 
 === ИНСТРУКЦИИ ===
-1. Ответь на вопрос, используя СТРОГО информацию из документов выше
-2. Если ответ требует нескольких пунктов - структурируй его (списки, абзацы)
-3. Приводи конкретные факты и детали из документов
-4. Если информации недостаточно - укажи, что известно, а что нет
-5. Будь точным и лаконичным
-6. НЕ придумывай информацию, которой нет в документах
+1. Отвечай СТРОГО на основе писем выше
+2. Указывай источник: дату и отправителя конкретного письма
+3. Если несколько писем касаются вопроса — упомяни все релевантные
+4. Если есть противоречия между письмами — отметь это явно
+5. Если информации нет — скажи об этом прямо
+6. НЕ придумывай детали, которых нет в переписке
+
+Твой ответ:"""
+
+
+def build_referral_prompt(context: str, query: str) -> str:
+    """Промпт когда прямого ответа нет, но в письмах есть смежная информация."""
+    return f"""Тебе предоставлены фрагменты писем, но прямого ответа на вопрос в них нет.
+
+=== ПИСЬМА ===
+{context}
+
+=== ВОПРОС ===
+{query}
+
+=== ИНСТРУКЦИЯ ===
+Прямого ответа нет. Изучи письма и:
+1. Если есть смежная информация (контакты, ссылки на другие документы, \
+упоминания участников) — сообщи об этом с указанием источника
+2. Если ничего релевантного нет — скажи, что в загруженной переписке \
+ответа не найдено
 
 Твой ответ:"""
 
@@ -86,226 +91,138 @@ def build_rag_prompt(context: str, query: str) -> str:
 # QUERY ENHANCEMENT PROMPT
 # =============================================================================
 
-QUERY_ENHANCEMENT_PROMPT_TEMPLATE = """Ты эксперт по анализу и улучшению поисковых запросов для базы знаний администрации Невского района Санкт-Петербурга (жилищные вопросы, социальные услуги, городское управление).
+QUERY_ENHANCEMENT_PROMPT_TEMPLATE = """Ты эксперт по анализу запросов к базе почтовой переписки.
 
 ЗАПРОС ПОЛЬЗОВАТЕЛЯ: "{query}"
 
 ТВОЯ ЗАДАЧА:
 1. Определить тип запроса (intent)
-2. Извлечь ключевые сущности и понятия
-3. Переформулировать запрос для улучшения поиска
-4. Сгенерировать альтернативные варианты запроса
+2. Извлечь ключевые сущности
+3. Переформулировать для улучшения поиска по письмам
+4. Сгенерировать альтернативные варианты
 
 ТИПЫ ЗАПРОСОВ (intent):
-- "factual" - фактический вопрос, требующий конкретной информации
-- "definition" - запрос определения или объяснения термина
-- "comparison" - сравнение нескольких объектов/понятий
-- "process" - как что-то работает, процесс или инструкция
-- "general" - общий вопрос
-- "small_talk" - приветствие, благодарность, светская беседа (привет, спасибо, как дела)
-- "inappropriate" - грубость, мат, оскорбления
-- "off_topic" - вопрос не по теме деятельности администрации
+- "search_by_sender"  — ищет письма от конкретного человека/компании
+- "search_by_date"    — ищет письма за период или конкретную дату
+- "search_by_topic"   — ищет письма по теме, проекту, предмету
+- "find_decision"     — ищет договорённости, решения, согласования
+- "find_task"         — ищет задачи, поручения, дедлайны
+- "find_contact"      — ищет контакты, реквизиты, адреса
+- "summarize_thread"  — просит пересказ цепочки переписки
+- "small_talk"        — приветствие, благодарность
+- "off_topic"         — вопрос не по теме переписки
 
-КРИТИЧЕСКИ ВАЖНО — ЖИЛИЩНАЯ ТЕРМИНОЛОГИЯ (НЕ ПУТАТЬ):
-- "учётная норма" / "норма учёта" — минимальный метраж на человека, НИЖЕ которого гражданина ставят на жилищный учёт (очередь). СПб: 9 кв.м в отдельных квартирах, 15 кв.м в коммунальных.
-- "норма предоставления" — сколько кв.м ДАЮТ при предоставлении жилья (расселении). СПб: 18 кв.м на человека (семья 2+), 33 кв.м одинокому.
-- Запросы про "встать на учёт", "встать в очередь", "постановка на учёт", "нуждающийся в улучшении жилищных условий" → используй термины "учётная норма", "норма учёта площади".
-- Запросы про "сколько дадут жильё", "при расселении", "при предоставлении" → используй термин "норма предоставления".
-
-ВЕРНИ ОТВЕТ СТРОГО В ФОРМАТЕ JSON (без дополнительного текста):
+ВЕРНИ СТРОГО JSON (без дополнительного текста):
 {{
-    "intent": "factual | definition | comparison | process | general",
-    "rewritten_query": "переформулированный запрос с ключевыми терминами и синонимами",
+    "intent": "...",
+    "rewritten_query": "переформулированный запрос с синонимами",
     "alternative_queries": [
         "альтернативный вариант 1",
         "альтернативный вариант 2"
     ],
     "entities": {{
-        "key_terms": ["список ключевых терминов и понятий"],
-        "named_entities": ["имена, места, организации если упомянуты"],
-        "temporal": ["даты, периоды если упомянуты"],
-        "numerical": ["числа, количества если упомянуты"]
+        "key_terms": ["ключевые слова и фразы"],
+        "named_entities": ["люди, компании, проекты"],
+        "temporal": ["даты и периоды если упомянуты"],
+        "numerical": ["числа и суммы если упомянуты"]
     }}
 }}
 
-CRITICAL RULES:
-1. **PRESERVE SPECIALIZED TERMS**:
-   - Keep ALL-CAPS acronyms unchanged (e.g., DNA, API, ROE)
-   - Keep domain-specific technical terms as-is
-   - Keep brand/product names with exact spelling
-   - Keep numbered standards/codes unchanged (e.g., 401k, COVID-19)
-   - DO NOT expand abbreviations unless you're certain it helps search
-
-2. **MAINTAIN SPECIFICITY**:
-   - Don't replace specific terms with vague generic ones
-   - Add related concepts, don't substitute
-   - Keep the original precision of the query
-
-3. **EXPAND, DON'T REPLACE**:
-   - Include original terms AND synonyms/related concepts
-   - Pattern: "original + synonym + related" NOT "synonym only"
-
-4. **USEFUL VARIANTS ONLY**:
-   - Generate variants that offer DIFFERENT search angles BUT SAME INTENT
-   - Use different keywords, synonyms, or framing for the SAME underlying question
-   - Each variant should help find the SAME information through different wording
-   - Skip variants that are just minor rephrasings
-   - NEVER generate variants with opposite or contradictory meaning
-
-5. **JSON FORMAT**:
-   - Empty arrays [] when no entities found
-   - NO text outside JSON
+ПРАВИЛА:
+1. Сохраняй имена собственные, названия компаний, проектов точно как в запросе
+2. Добавляй синонимы (договор/соглашение, встреча/совещание/звонок)
+3. Для поиска по отправителю добавляй вариант с email-форматом
+4. Для поиска по дате добавляй разные форматы (15 апреля / 15.04 / April 15)
+5. Пустые массивы [] если ничего не найдено
+6. ТОЛЬКО JSON, ничего лишнего
 
 ПРИМЕРЫ:
 
-Запрос: "What is photosynthesis?"
+Запрос: "письма от Иванова про договор"
 {{
-    "intent": "definition",
-    "rewritten_query": "photosynthesis process plant cells chlorophyll light energy",
+    "intent": "search_by_topic",
+    "rewritten_query": "Иванов договор соглашение контракт",
     "alternative_queries": [
-        "how does photosynthesis work in plants",
-        "photosynthesis definition biology"
+        "письмо от Иванова договор подписание",
+        "Иванов согласование контракт документ"
     ],
     "entities": {{
-        "key_terms": ["photosynthesis", "plant biology", "cellular process"],
+        "key_terms": ["договор", "соглашение", "контракт"],
+        "named_entities": ["Иванов"],
+        "temporal": [],
+        "numerical": []
+    }}
+}}
+
+Запрос: "что решили на прошлой неделе по проекту Альфа"
+{{
+    "intent": "find_decision",
+    "rewritten_query": "решение договорённость проект Альфа",
+    "alternative_queries": [
+        "согласовано утверждено проект Альфа",
+        "итоги обсуждения Альфа договорились"
+    ],
+    "entities": {{
+        "key_terms": ["решение", "договорённость", "итоги"],
+        "named_entities": ["проект Альфа"],
+        "temporal": ["прошлая неделя"],
+        "numerical": []
+    }}
+}}
+
+Запрос: "дедлайн по сдаче отчёта"
+{{
+    "intent": "find_task",
+    "rewritten_query": "дедлайн срок сдача отчёт",
+    "alternative_queries": [
+        "когда сдать отчёт срок выполнения",
+        "дата сдачи отчёта поручение задача"
+    ],
+    "entities": {{
+        "key_terms": ["дедлайн", "срок", "отчёт"],
         "named_entities": [],
         "temporal": [],
         "numerical": []
     }}
 }}
 
-Запрос: "sociologists define ethnicity as a system for classifying people"
-{{
-    "intent": "definition",
-    "rewritten_query": "ethnicity definition sociology classification system social groups",
-    "alternative_queries": [
-        "how do sociologists define ethnicity",
-        "sociological concept of ethnicity classification"
-    ],
-    "entities": {{
-        "key_terms": ["ethnicity", "sociology", "classification", "social groups"],
-        "named_entities": [],
-        "temporal": [],
-        "numerical": []
-    }}
-}}
-
-Запрос: "how long can you freeze salmon for"
-{{
-    "intent": "factual",
-    "rewritten_query": "salmon freezing duration storage time frozen fish",
-    "alternative_queries": [
-        "maximum time to freeze salmon",
-        "how long salmon stays good frozen"
-    ],
-    "entities": {{
-        "key_terms": ["salmon", "freezing", "storage duration", "food preservation"],
-        "named_entities": ["salmon"],
-        "temporal": [],
-        "numerical": []
-    }}
-}}
-
-Запрос: "What does high operating margin but small positive ROE imply?"
-{{
-    "intent": "factual",
-    "rewritten_query": "high operating margin low ROE financial performance profitability efficiency capital structure",
-    "alternative_queries": [
-        "operating margin vs ROE relationship company analysis",
-        "high operating margin with low return on equity implications"
-    ],
-    "entities": {{
-        "key_terms": ["operating margin", "ROE", "profitability", "financial metrics", "capital efficiency"],
-        "named_entities": [],
-        "temporal": [],
-        "numerical": ["high", "small", "positive"]
-    }}
-}}
-
-Запрос: "какой должен быть метраж чтобы встать на очередь"
-{{
-    "intent": "factual",
-    "rewritten_query": "учётная норма площади жилого помещения постановка на жилищный учёт нуждающийся",
-    "alternative_queries": [
-        "учётная норма 9 квадратных метров жилищный учёт нуждающийся в жилых помещениях Санкт-Петербург",
-        "закон Санкт-Петербурга статья 3 учётная норма площади постановка на учёт нуждающийся"
-    ],
-    "entities": {{
-        "key_terms": ["учётная норма", "постановка на жилищный учёт", "нуждающийся в жилых помещениях"],
-        "named_entities": ["Санкт-Петербург"],
-        "temporal": [],
-        "numerical": ["9", "15"]
-    }}
-}}
-
-Now process the user's query and return ONLY JSON:"""
+Теперь обработай запрос пользователя. Только JSON:"""
 
 
 def build_query_enhancement_prompt(query: str) -> str:
-    """
-    Строит промпт для улучшения поискового запроса.
-
-    Args:
-        query: Исходный запрос пользователя
-
-    Returns:
-        Готовый промпт для LLM
-    """
     return QUERY_ENHANCEMENT_PROMPT_TEMPLATE.format(query=query)
 
 
 # =============================================================================
-# ASPECT EXTRACTION PROMPT (для Query Decomposition)
+# ASPECT EXTRACTION PROMPT (Query Decomposition)
 # =============================================================================
 
-ASPECT_EXTRACTION_PROMPT_TEMPLATE = """You are a query analysis expert. Your task is to decide if a query needs decomposition and extract independent searchable aspects.
+ASPECT_EXTRACTION_PROMPT_TEMPLATE = """You are a query analysis expert for an email search system. \
+Decide if a query needs decomposition and extract independent searchable aspects.
 
 CRITICAL RULES:
 1. ALWAYS include "original" key with the full original query
 2. Simple query (1 concept) → Return ONLY {{"original": "query"}} (triggers baseline)
-3. Complex query (2+ concepts) → Add 1-4 additional aspects (decomposition mode)
-4. Each aspect should be INDEPENDENT and SEARCHABLE
-5. Aspects should NOT semantically overlap
+3. Complex query (2+ independent aspects) → Add 1-4 additional aspects
+4. Each aspect must be INDEPENDENT and SEARCHABLE
+5. Aspects must NOT semantically overlap
 6. Max 5 total aspects (including original)
 
 EXAMPLES:
 
-Simple query (NO decomposition needed):
-Input: "что такое фотосинтез"
-Output:
-{{
-  "original": "что такое фотосинтез"
-}}
-→ Only 1 aspect → System will use BASELINE retrieval
+Simple (NO decomposition):
+Input: "письма от Петрова"
+Output: {{"original": "письма от Петрова"}}
 
-Complex query (decomposition needed):
-Input: "Сравни преимущества и риски инвестиций в облигации и акции"
+Complex (decomposition needed):
+Input: "что обсуждали с Петровым и Сидоровым про бюджет и сроки"
 Output:
 {{
-  "original": "Сравни преимущества и риски инвестиций в облигации и акции",
-  "bonds": "преимущества и риски облигаций",
-  "stocks": "преимущества и риски акций",
-  "comparison": "сравнение облигации vs акции инвестиции"
-}}
-→ 4 aspects → System will use DECOMPOSITION with weighted fusion
-
-Multi-aspect query:
-Input: "Retirement investment with low risk and high liquidity"
-Output:
-{{
-  "original": "Retirement investment with low risk and high liquidity",
-  "goal": "retirement investment strategy",
-  "risk": "low risk portfolio",
-  "liquidity": "high liquidity assets"
-}}
-
-Multi-hop query:
-Input: "Who is the spouse of the director of Inception?"
-Output:
-{{
-  "original": "Who is the spouse of the director of Inception?",
-  "movie_director": "director of Inception",
-  "director_spouse": "Christopher Nolan spouse"
+  "original": "что обсуждали с Петровым и Сидоровым про бюджет и сроки",
+  "petrov": "переписка с Петровым",
+  "sidorov": "переписка с Сидоровым",
+  "budget": "бюджет финансирование",
+  "deadlines": "сроки дедлайны даты"
 }}
 
 Now analyze:
@@ -315,27 +232,43 @@ Return ONLY JSON dict with "original" key ALWAYS present. Nothing else."""
 
 
 def build_aspect_extraction_prompt(query: str) -> str:
-    """
-    Строит промпт для извлечения аспектов из запроса (query decomposition).
-
-    Args:
-        query: Исходный запрос пользователя
-
-    Returns:
-        Готовый промпт для LLM
-    """
     return ASPECT_EXTRACTION_PROMPT_TEMPLATE.format(query=query)
+
+
+# =============================================================================
+# COMPLEXITY ANALYSIS PROMPT (Adaptive routing)
+# =============================================================================
+
+COMPLEXITY_ANALYSIS_PROMPT_TEMPLATE = """Analyze the complexity of this email search query and return JSON.
+
+Query: "{query}"
+
+Determine:
+1. Is this a multi-hop query? (requires chaining: "кто написал Петрову после того как..." → find email → find reply)
+2. Does it have multiple independent aspects? (sender AND topic AND date range)
+3. Is it simple? (single lookup)
+
+Return JSON:
+{{
+    "complexity": "simple | multi_aspect | multi_hop",
+    "hops": [
+        {{"query": "first lookup", "extract": "what to get from result"}},
+        {{"query": "second lookup using {{prev}}", "extract": "final answer"}}
+    ],
+    "reasoning": "brief explanation"
+}}
+
+Only include "hops" for multi_hop complexity. Return ONLY JSON."""
+
+
+def build_complexity_analysis_prompt(query: str) -> str:
+    return COMPLEXITY_ANALYSIS_PROMPT_TEMPLATE.format(query=query)
 
 
 # =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
 
-# Включить/выключить query enhancement для тестирования
-ENABLE_QUERY_ENHANCEMENT = True  # Можно отключить для базового RAG тестирования
-
-# Минимальная релевантность для фильтрации результатов
+ENABLE_QUERY_ENHANCEMENT = True
 MIN_RELEVANCE_SCORE = 0.35
-
-# Количество документов для retrieval
 DEFAULT_TOP_K = 8

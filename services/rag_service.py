@@ -363,23 +363,17 @@ class RAGService:
         use_history = os.getenv('USE_CONVERSATION_HISTORY', 'false').lower() == 'true'
 
         if not search_results:
-            llm_start = time.perf_counter()
-            if use_history:
-                app_state.add_role_message(user_id, query, role="user")
-                answer = await app_state.llm_client.chat_query(app_state.get_user_messages(user_id))
-                app_state.add_role_message(user_id, answer, role="assistant")
-            else:
-                answer = await app_state.llm_client.simple_query(query)
-            llm_time = time.perf_counter() - llm_start
             total_time = time.perf_counter() - total_start
             print(
                 "[timing] rag_chat: "
                 f"enhancement={enhancement_time:.3f}s "
                 f"search={search_time:.3f}s "
-                f"llm={llm_time:.3f}s "
                 f"total={total_time:.3f}s (no_results)"
             )
-            return {"answer": answer, "sources": []}
+            return {
+                "answer": "В загруженных письмах не найдено информации по вашему запросу.",
+                "sources": []
+            }
 
         # Entity boosting: rerank using NER overlap between query and chunk entities
         query_entities = enhanced.get("entities", {}).get("named_entities", [])
@@ -563,25 +557,32 @@ class RAGService:
 
     def _build_context(self, relevant_results: List[Dict]) -> str:
         context_parts = []
-        seen_sources = {}
 
-        for i, doc in enumerate(relevant_results):
-            source_info = doc['metadata'].get('source', 'неизвестно')
-            chunk_id = doc['metadata'].get('chunk_id', 0)
-            score = doc.get('score', 0)
+        for i, doc in enumerate(relevant_results, 1):
+            meta = doc.get('metadata', {})
 
-            if source_info not in seen_sources:
-                seen_sources[source_info] = []
-            seen_sources[source_info].append({
-                'text': doc['text'],
-                'chunk_id': chunk_id,
-                'score': score
-            })
+            # Email-атрибуция если есть метаданные письма
+            email_date    = meta.get('email_date', '')
+            email_from    = meta.get('email_from', '')
+            email_subject = meta.get('email_subject', '')
+            email_index   = meta.get('email_index')
 
-        for idx, (source, chunks) in enumerate(seen_sources.items(), 1):
-            context_parts.append(f"[Документ {idx}: {source}]")
-            for chunk in sorted(chunks, key=lambda x: -x['score']):
-                context_parts.append(f"{chunk['text']}\n")
+            label_parts = []
+            if email_date:
+                label_parts.append(email_date)
+            if email_from:
+                label_parts.append(f"от {email_from}")
+            if email_subject:
+                label_parts.append(f"тема: «{email_subject}»")
+            if not label_parts:
+                src = meta.get('source', 'неизвестно')
+                chunk = meta.get('chunk_id', 0)
+                label_parts.append(f"{src}, фрагмент {chunk}")
+
+            label = ", ".join(label_parts)
+            context_parts.append(f"[Письмо {i}: {label}]")
+            context_parts.append(doc['text'])
+            context_parts.append("")
 
         return "\n".join(context_parts)
 
