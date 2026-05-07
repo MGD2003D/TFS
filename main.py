@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from api.routes import api_router
 from contextlib import asynccontextmanager
-from services.llm.caila_client import CailaClient
 from services.vectorstore.qdrant_client import QdrantVectorStore
 from services.document_indexer import DocumentIndexer
 from services.minio_storage import MinioStorageService
@@ -23,7 +22,14 @@ async def lifespan(app: FastAPI):
     print("\n=== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ===")
 
     print("1/8 Инициализация LLM клиента...")
-    llm_client = CailaClient()
+    llm_backend = os.getenv("LLM_BACKEND", "gemini").lower()
+    if llm_backend == "qwen":
+        from services.llm.caila_client import CailaClient
+        llm_client = CailaClient()
+    else:
+        from services.llm.gemini_client import GeminiClient
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        llm_client = GeminiClient(model=gemini_model)
     app_state.llm_client = llm_client
     await llm_client.initialize()
     print("LLM клиент готов")
@@ -102,6 +108,10 @@ async def lifespan(app: FastAPI):
         initialize_services()
         app_state.services_ready = True
         print("Все сервисы инициализированы и готовы к работе")
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         bot_task = asyncio.create_task(dp.start_polling(bot))
         print("Telegram бот запущен")
 

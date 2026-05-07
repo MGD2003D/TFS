@@ -100,28 +100,33 @@ class QdrantVectorStore(BaseVectorStore):
             # Traditional: SentenceTransformer + BM25
             is_cached = _is_model_cached(self.embedding_model_name, cache_dir)
             if is_cached:
-                print(f"Загружаю embedding модель {self.embedding_model_name} из кэша ({cache_dir})...")
+                print(f"Загружаю embedding модель {self.embedding_model_name} из кэша ({cache_dir})...", flush=True)
             else:
-                print(f"Скачиваю embedding модель {self.embedding_model_name} (~500MB), кэш: {cache_dir or 'по умолчанию'}")
-                print("Прогресс скачивания отображается ниже:")
+                print(f"Скачиваю embedding модель {self.embedding_model_name} (~500MB), кэш: {cache_dir or 'по умолчанию'}", flush=True)
+                print("Прогресс скачивания отображается ниже:", flush=True)
 
+            # Таймаут на HF Hub запросы
+            os.environ.setdefault("HF_HUB_HTTP_TIMEOUT", "60")
+
+            print(f"[ST] Запускаю SentenceTransformer({self.embedding_model_name})...", flush=True)
             t0 = time.time()
             self.embedding_model = SentenceTransformer(
                 self.embedding_model_name,
                 device=device,
-                cache_folder=cache_dir
+                cache_folder=cache_dir,
             )
             elapsed = time.time() - t0
-            print(f"Модель {self.embedding_model_name} загружена на {device.upper()} за {elapsed:.1f}s")
+            print(f"[ST] Модель загружена на {device.upper()} за {elapsed:.1f}s", flush=True)
 
             vector_size = self.embedding_model.get_sentence_embedding_dimension()
 
             if self.enable_hybrid_search:
-                print("Инициализация BM25 Sparse Encoder для Hybrid Search...")
+                print("[BM25] Инициализация Sparse Encoder...", flush=True)
                 self.sparse_encoder = BM25SparseEncoder()
                 self.sparse_vocab_ready = False
-                print("BM25 Sparse Encoder готов")
+                print("[BM25] Sparse Encoder готов", flush=True)
 
+        print("[Qdrant] Проверяю коллекции...", flush=True)
         collections = self.client.get_collections().collections
         collection_exists = any(col.name == self.collection_name for col in collections)
 
