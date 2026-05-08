@@ -149,3 +149,39 @@ async def sync_on_startup(minio_storage, vector_store, document_indexer):
         traceback.print_exc()
 
     print("=" * 60 + "\n")
+
+
+async def sync_templates_on_startup(minio_storage, vector_store_templates, template_indexer):
+    print("\n" + "=" * 60)
+    print("Синхронизация шаблонов писем MinIO -> Qdrant")
+    print("=" * 60)
+
+    templates_bucket = os.getenv("MINIO_TEMPLATES_BUCKET", "mail-templates")
+
+    try:
+        template_files = await minio_storage.list_documents(
+            namespaces=None, bucket_name=templates_bucket
+        )
+        print(f"Найдено CSV-шаблонов в MinIO: {len(template_files)}")
+
+        for doc in template_files:
+            filename = doc["filename"]
+            if not filename.lower().endswith(".csv"):
+                continue
+            try:
+                content = await minio_storage.download_document(
+                    doc.get("document_id"), filename, templates_bucket
+                )
+                count = await template_indexer.index_from_bytes(
+                    content, source=filename, vector_store=vector_store_templates
+                )
+                print(f"  ✓ {filename}: {count} шаблонов")
+            except Exception as e:
+                print(f"  ✗ {filename}: {e}")
+
+    except Exception as e:
+        print(f"Ошибка синхронизации шаблонов: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("=" * 60 + "\n")

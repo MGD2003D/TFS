@@ -32,6 +32,7 @@ class MinioStorageService:
         self.secret_key = secret_key
         self.bucket_name = bucket_name
         self.corporate_bucket = os.getenv("MINIO_CORPORATE_BUCKET", "documents-corporate")
+        self.templates_bucket = os.getenv("MINIO_TEMPLATES_BUCKET", "mail-templates")
         self.secure = secure
         self.client = None
 
@@ -50,6 +51,12 @@ class MinioStorageService:
                 print(f"Создан корпоративный bucket MinIO: {self.corporate_bucket}")
             else:
                 print(f"Корпоративный bucket MinIO '{self.corporate_bucket}' уже существует")
+
+            if not self.client.bucket_exists(self.templates_bucket):
+                self.client.make_bucket(self.templates_bucket)
+                print(f"Создан bucket шаблонов MinIO: {self.templates_bucket}")
+            else:
+                print(f"Bucket шаблонов MinIO '{self.templates_bucket}' уже существует")
 
         except S3Error as e:
             print(f"Ошибка MinIO S3: {e}")

@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
+TEMPLATE_EXTENSIONS = {".csv"}
 
 
 def normalize_extension(filename: str) -> str:
@@ -10,6 +11,10 @@ def normalize_extension(filename: str) -> str:
 
 def is_supported_document(filename: str) -> bool:
     return normalize_extension(filename) in SUPPORTED_EXTENSIONS
+
+
+def is_template_file(filename: str) -> bool:
+    return normalize_extension(filename) in TEMPLATE_EXTENSIONS
 
 
 def get_content_type(filename: str) -> str:

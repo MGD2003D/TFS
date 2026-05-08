@@ -6,12 +6,11 @@ import asyncio
 import logging
 from pathlib import Path
 from contextlib import suppress
-import io
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 from aiogram.enums import ParseMode, ChatAction
 from dotenv import load_dotenv
@@ -21,6 +20,8 @@ from tg_bot.formatters import format_telegram_message
 from tg_bot import custom_emoji
 import app_state
 # from texts import MESSAGES
+
+user_mode: dict = {}  # tg_id → "search" | "compose"
 
 load_dotenv()
 
@@ -36,7 +37,6 @@ rag_service = None
 chat_service = None
 
 user_search_preferences = {}
-user_upload_preferences = {}
 
 async def initialize_custom_emoji():
     """Инициализация кастомных эмодзи из стикерпака"""
@@ -81,16 +81,42 @@ async def cmd_start(message: types.Message):
     chat_service.clear_chat_history(tg_id)
 
     await message.answer(
-        "👋 Привет! Я ИИ-ассистент!\n\n"
+        "👋 Привет! Я ИИ-ассистент Жилищного комитета!\n\n"
         "📚 Команды:\n"
-        "/search_mode - режим поиска (personal/corporate/personal_corporate)\n"
-        "/upload_mode - режим загрузки документов (personal/corporate)\n"
-        "/start - начать сначала\n\n"
+        "/search — поиск по документам (по умолчанию)\n"
+        "/compose — составление ответного письма\n"
+        "/search_mode — режим поиска (personal/corporate/personal_corporate)\n"
+        "/start — начать сначала\n\n"
         "💡 Вы можете:\n"
-        "• Задавать вопросы по документам\n"
-        "• Загружать документы (.pdf, .docx)\n"
-        "• Переключать хранилища для поиска"
+        "• Задавать вопросы по загруженным документам\n"
+        "• Вставлять обращение граждан для составления ответа"
     )
+
+@dp.message(Command("compose"))
+async def cmd_compose(message: types.Message):
+    if not app_state.services_ready:
+        await message.answer("⏳ Сервисы еще загружаются, подождите...")
+        return
+    tg_id = message.from_user.id
+    user_mode[tg_id] = "compose"
+    await message.answer(
+        "✍️ Режим составления писем активирован.\n\n"
+        "Вставьте текст входящего обращения — я подготовлю черновик официального ответа."
+    )
+
+
+@dp.message(Command("search"))
+async def cmd_search(message: types.Message):
+    if not app_state.services_ready:
+        await message.answer("⏳ Сервисы еще загружаются, подождите...")
+        return
+    tg_id = message.from_user.id
+    user_mode[tg_id] = "search"
+    await message.answer(
+        "🔍 Режим поиска активирован.\n\n"
+        "Задайте вопрос по загруженным документам."
+    )
+
 
 @dp.message(Command("search_mode"))
 async def cmd_search_mode(message: types.Message):
@@ -126,99 +152,7 @@ async def cmd_search_mode(message: types.Message):
     await message.answer(f"✅ Режим поиска: {mode_names[mode]}")
 
 
-@dp.message(Command("upload_mode"))
-async def cmd_upload_mode(message: types.Message):
 
-    if not app_state.services_ready:
-        await message.answer("⏳ Сервисы еще загружаются, подождите...")
-        return
-
-    tg_id = message.from_user.id
-    args = message.text.split()[1:] if len(message.text.split()) > 1 else []
-
-    valid_modes = ["personal", "corporate"]
-
-    if not args or args[0] not in valid_modes:
-        current = user_upload_preferences.get(tg_id, "personal")
-        await message.answer(
-            f"📤 Текущий режим загрузки: {current}\n\n"
-            "Использование: /upload_mode <personal|corporate>\n\n"
-            "• personal - в ваше личное хранилище (по умолчанию) 📄\n"
-            "• corporate - в корпоративное хранилище (доступно всем) 🏢"
-        )
-        return
-
-    mode = args[0]
-    user_upload_preferences[tg_id] = mode
-
-    mode_names = {
-        "personal": "Личное хранилище 📄",
-        "corporate": "Корпоративное хранилище 🏢"
-    }
-    await message.answer(f"✅ Документы будут загружаться в: {mode_names[mode]}")
-
-@dp.message(F.document)
-async def upload_document(message: types.Message):
-
-    if not app_state.services_ready or not rag_service:
-        await message.answer("⏳ Сервисы еще загружаются, подождите...")
-        return
-
-    tg_id = message.from_user.id
-    document = message.document
-
-    filename = document.file_name or "document"
-    from services.document_types import is_supported_document
-    if not is_supported_document(filename):
-        await message.answer(
-            "❌ Неподдерживаемый формат файла.\n"
-            "Поддерживаются только: .pdf, .docx"
-        )
-        return
-
-    status_msg = await message.answer(f"📥 Загружаю документ: {filename}...")
-
-    try:
-        file_info = await bot.get_file(document.file_id)
-        file_data = await bot.download_file(file_info.file_path)
-
-        upload_mode = user_upload_preferences.get(tg_id, "personal")
-        is_corporate = (upload_mode == "corporate")
-
-        class TelegramFile:
-            def __init__(self, data, filename):
-                self.file = io.BytesIO(data)
-                self.filename = filename
-
-            async def read(self):
-                return self.file.read()
-
-        file_obj = TelegramFile(file_data.read(), filename)
-
-        result = await rag_service.upload_and_index_document(
-            file_obj,
-            user_id=str(tg_id),
-            is_corporate=is_corporate
-        )
-
-        storage_type = "корпоративное 🏢" if is_corporate else "личное 📄"
-        await status_msg.edit_text(
-            f"✅ Документ загружен в {storage_type} хранилище!\n\n"
-            f"📄 Файл: {result['filename']}\n"
-            f"📊 Проиндексировано чанков: {result['chunks_indexed']}\n"
-            f"💾 Размер: {result['size'] / 1024:.1f} KB\n\n"
-            f"Теперь можете задавать вопросы по этому документу!"
-        )
-
-    except ValueError as e:
-        await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
-    except Exception as e:
-        print(f"[ERROR] Upload failed: {e}")
-        import traceback
-        traceback.print_exc()
-        await status_msg.edit_text(
-            "❌ Не удалось загрузить документ. Попробуйте позже."
-        )
 
 @dp.message()
 async def any_message(message: types.Message):
@@ -227,16 +161,25 @@ async def any_message(message: types.Message):
         return
 
     tg_id = message.from_user.id
-
-    scope = user_search_preferences.get(tg_id, "personal_corporate")
+    mode = user_mode.get(tg_id, "search")
 
     typing_task = asyncio.create_task(_typing_indicator(message.chat.id))
     try:
-        result = await rag_service.chat_query(
-            str(tg_id),
-            message.text,
-            scope=scope
-        )
+        if mode == "compose":
+            if not app_state.letter_composer:
+                await message.answer("❌ Сервис составления писем недоступен.")
+                return
+            result = await app_state.letter_composer.compose(message.text, str(tg_id))
+            draft = result.get("draft", "")
+            await message.answer(f"📝 Черновик ответа:\n\n{draft}")
+            return
+        else:
+            scope = user_search_preferences.get(tg_id, "personal_corporate")
+            result = await rag_service.chat_query(
+                str(tg_id),
+                message.text,
+                scope=scope
+            )
     finally:
         typing_task.cancel()
         with suppress(asyncio.CancelledError):

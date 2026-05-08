@@ -1,6 +1,7 @@
 fastapi[standard]
 python-dotenv
 aiohttp
+openai
 
 qdrant-client
 

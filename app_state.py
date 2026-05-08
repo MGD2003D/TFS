@@ -5,7 +5,10 @@ import prompts_config
 
 llm_client = None
 vector_store = None
+vector_store_templates = None
 document_indexer = None
+template_indexer = None
+letter_composer = None
 minio_storage = None
 query_enhancer = None
 

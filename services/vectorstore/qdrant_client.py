@@ -617,6 +617,21 @@ class QdrantVectorStore(BaseVectorStore):
         print(f"Удалены чанки документа {document_id} из Qdrant")
         return result
 
+    async def delete_by_source(self, source: str) -> None:
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source",
+                            match=models.MatchValue(value=source)
+                        )
+                    ]
+                )
+            )
+        )
+
     async def get_documents_list(self) -> List[Dict[str, Any]]:
         scroll_result = self.client.scroll(
             collection_name=self.collection_name,

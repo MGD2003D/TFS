@@ -6,7 +6,7 @@ from services.vectorstore.qdrant_client import QdrantVectorStore
 from services.document_indexer import DocumentIndexer
 from services.minio_storage import MinioStorageService
 from services.minio_event_listener import MinioEventListener
-from services.startup_sync import sync_on_startup
+from services.startup_sync import sync_on_startup, sync_templates_on_startup
 from services.chat_cleanup import ChatCleanupWorker
 from services.query_enhancer import QueryEnhancerService
 import app_state
@@ -18,7 +18,7 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global llm_client, vector_store, document_indexer, minio_storage, minio_event_listener, bot_task, chat_cleanup_worker, query_enhancer
+    global llm_client, vector_store, vector_store_templates, document_indexer, template_indexer, letter_composer, minio_storage, minio_event_listener, bot_task, chat_cleanup_worker, query_enhancer
 
     print("\n=== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ===")
 
@@ -65,6 +65,24 @@ async def lifespan(app: FastAPI):
     app_state.query_enhancer = query_enhancer
     print("Query Enhancer готов")
 
+    print("\n4.6/8 Инициализация коллекции шаблонов писем...")
+    from services.template_indexer import TemplateIndexer
+    from services.letter_composer import LetterComposer
+    vector_store_templates = QdrantVectorStore(
+        host=os.getenv("QDRANT_HOST", "localhost"),
+        port=int(os.getenv("QDRANT_PORT", "6333")),
+        collection_name="mail_templates",
+        embedding_model="intfloat/multilingual-e5-base",
+        enable_hybrid_search=False,
+    )
+    app_state.vector_store_templates = vector_store_templates
+    await vector_store_templates.initialize()
+    template_indexer = TemplateIndexer()
+    app_state.template_indexer = template_indexer
+    letter_composer = LetterComposer()
+    app_state.letter_composer = letter_composer
+    print("Шаблоны писем готовы")
+
     print("\n5/8 Starting chat cleanup worker...")
     chat_cleanup_worker = ChatCleanupWorker(
         ttl_seconds=int(os.getenv("CHAT_TTL_SECONDS", "3600")),
@@ -75,6 +93,7 @@ async def lifespan(app: FastAPI):
 
     print("\n6/8 Синхронизация MinIO -> Qdrant...")
     await sync_on_startup(minio_storage, vector_store, document_indexer)
+    await sync_templates_on_startup(minio_storage, vector_store_templates, template_indexer)
     print("Синхронизация завершена")
 
     print("\n7/8 Запуск MinIO Event Listener...")
@@ -124,6 +143,7 @@ async def lifespan(app: FastAPI):
 
     await llm_client.cleanup()
     await vector_store.cleanup()
+    await vector_store_templates.cleanup()
     await minio_storage.cleanup()
     print("=== СЕРВИСЫ ОСТАНОВЛЕНЫ ===\n")
 

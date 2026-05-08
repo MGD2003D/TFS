@@ -28,7 +28,7 @@ services:
       - tfs-network
 
   api:
-    image: mgd2003d/zho-nevskogo-bot-api:latest
+    image: mgd2003d/mail_nav:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -47,6 +47,8 @@ services:
       - BOT_TOKEN=${BOT_TOKEN:-}
       - MAX_BOT_TOKEN=${MAX_BOT_TOKEN:-}
       - CAILA_TOKEN=${CAILA_TOKEN}
+      - MIRA_TOKEN=${MIRA_TOKEN}
+      - MIRA_MODEL=${MIRA_MODEL:-khajaphysist/Qwen3-32B-FP8-Dynamic}
       - HF_TOKEN=${HF_TOKEN:-}
       - USE_CONVERSATION_HISTORY=${USE_CONVERSATION_HISTORY:-false}
       - HF_HOME=/app/.cache/huggingface
