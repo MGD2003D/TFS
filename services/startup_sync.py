@@ -1,6 +1,5 @@
 import tempfile
 import os
-import hashlib
 from services.document_types import temp_suffix_for
 
 
@@ -16,76 +15,93 @@ async def sync_on_startup(minio_storage, vector_store, document_indexer):
         print(f"MinIO: {len(minio_docs)} документов")
         print(f"Qdrant: {len(qdrant_docs)} документов")
 
-        minio_doc_hashes = {}
-        for doc in minio_docs:
-            try:
-                content = await minio_storage.download_document(
-                    doc['document_id'],
-                    doc['filename']
-                )
-                content_hash = hashlib.sha256(content).hexdigest()[:16]
-                minio_doc_hashes[content_hash] = {
-                    'filename': doc['filename'],
-                    'content': content,
-                    'document_id': doc['document_id']
-                }
-            except Exception as e:
-                print(f"⚠ Ошибка при загрузке {doc['filename']}: {e}")
+        minio_map = {doc['document_id']: doc for doc in minio_docs}
+        qdrant_map = {doc['document_id']: doc for doc in qdrant_docs}
 
-        qdrant_doc_ids = {doc['document_id'] for doc in qdrant_docs}
+        # Detect incomplete indexes (indexed_chunks < total_chunks)
+        incomplete_ids = {
+            doc_id
+            for doc_id, doc in qdrant_map.items()
+            if doc.get('total_chunks', 0) > 0
+            and doc.get('indexed_chunks', 0) != doc.get('total_chunks', 0)
+        }
+        if incomplete_ids:
+            print(f"\n⚠ Обнаружены неполные индексы ({len(incomplete_ids)} документов):")
+            for doc_id in incomplete_ids:
+                doc = qdrant_map[doc_id]
+                print(f"  - {doc.get('source', doc_id)}: "
+                      f"{doc.get('indexed_chunks', 0)}/{doc.get('total_chunks', 0)} чанков")
+            print("  → Удаляем из Qdrant и переиндексируем...")
+            for doc_id in incomplete_ids:
+                try:
+                    await vector_store.delete_by_document_id(doc_id)
+                except Exception as e:
+                    print(f"  Не удалось удалить {doc_id}: {e}")
+            qdrant_map = {k: v for k, v in qdrant_map.items() if k not in incomplete_ids}
 
-        missing_in_qdrant = []
-        for content_hash, doc_info in minio_doc_hashes.items():
-            if content_hash not in qdrant_doc_ids:
-                missing_in_qdrant.append((content_hash, doc_info))
-
-        extra_in_qdrant = qdrant_doc_ids - set(minio_doc_hashes.keys())
+        missing = [doc for doc in minio_docs if doc['document_id'] not in qdrant_map]
+        # Re-add incomplete docs that exist in MinIO
+        for doc_id in incomplete_ids:
+            if doc_id in minio_map:
+                missing.append(minio_map[doc_id])
+        extra = [doc_id for doc_id in qdrant_map if doc_id not in minio_map]
 
         print(f"\nСтатус синхронизации:")
-        print(f"Синхронизировано: {len(qdrant_doc_ids & set(minio_doc_hashes.keys()))} документов")
-        print(f"Требуется индексация: {len(missing_in_qdrant)} документов")
-        print(f"Лишние в Qdrant: {len(extra_in_qdrant)} документов")
+        print(f"Синхронизировано: {len(minio_map) - len(missing)} документов")
+        print(f"Требуется индексация: {len(missing)} документов")
+        print(f"Лишние в Qdrant: {len(extra)} документов")
 
-        if missing_in_qdrant:
+        if missing:
             print(f"\nИндексация недостающих документов...")
-            for idx, (content_hash, doc_info) in enumerate(missing_in_qdrant, 1):
-                filename = doc_info['filename']
-                content = doc_info['content']
-
-                print(f"  [{idx}/{len(missing_in_qdrant)}] {filename} (hash: {content_hash})")
+            for idx, doc in enumerate(missing, 1):
+                document_id = doc['document_id']
+                filename = doc['filename']
+                print(f"  [{idx}/{len(missing)}] {filename} (id: {document_id})")
 
                 try:
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix_for(filename))
-                    temp_file.write(content)
-                    temp_file.close()
+                    content = await minio_storage.download_document(document_id, filename)
+
+                    tmp = tempfile.NamedTemporaryFile(
+                        delete=False, suffix=temp_suffix_for(filename)
+                    )
+                    tmp.write(content)
+                    tmp.close()
 
                     try:
                         chunks, metadata = await document_indexer.process_document(
-                            temp_file.name,
-                            document_id=content_hash,
+                            tmp.name,
+                            document_id=document_id,
                             original_filename=filename
                         )
                         await vector_store.add_documents(chunks, metadata)
-                        print(f"\
-                              Проиндексировано {len(chunks)} чанков")
+                        print(f"    ✓ Проиндексировано {len(chunks)} чанков")
+
+                    except Exception as idx_err:
+                        import traceback
+                        print(f"    ✗ Ошибка индексации: {idx_err}")
+                        traceback.print_exc()
+                        try:
+                            await vector_store.delete_by_document_id(document_id)
+                        except Exception:
+                            pass
 
                     finally:
-                        if os.path.exists(temp_file.name):
-                            os.unlink(temp_file.name)
+                        if os.path.exists(tmp.name):
+                            os.unlink(tmp.name)
 
                 except Exception as e:
-                    print(f"    ✗ Ошибка: {e}")
+                    print(f"    ✗ Ошибка при подготовке документа: {e}")
 
-        if extra_in_qdrant:
-            print(f"\n🗑 Удаление лишних документов из Qdrant...")
-            for doc_id in extra_in_qdrant:
+        if extra:
+            print(f"\nУдаление лишних документов из Qdrant...")
+            for doc_id in extra:
                 try:
                     await vector_store.delete_by_document_id(doc_id)
-                    print(f"Удален документ с ID: {doc_id}")
+                    print(f"  Удален: {doc_id}")
                 except Exception as e:
-                    print(f"Ошибка при удалении {doc_id}: {e}")
+                    print(f"  Ошибка при удалении {doc_id}: {e}")
 
-        if not missing_in_qdrant and not extra_in_qdrant:
+        if not missing and not extra:
             print("\nВсе документы синхронизированы!")
         else:
             print("\nСинхронизация завершена!")

@@ -6,6 +6,7 @@ import tempfile
 import os
 import io
 import time
+import asyncio
 from services.document_types import is_supported_document, temp_suffix_for
 from tg_bot import custom_emoji as ce
 
@@ -233,6 +234,61 @@ class RAGService:
         else:
             search_queries = [query]
 
+        # Query decomposition path
+        enable_decomposition = os.getenv('ENABLE_DECOMPOSITION', 'false').lower() == 'true'
+        extract_aspects_fn = getattr(app_state.llm_client, 'extract_aspects', None)
+
+        if enable_decomposition and self.enable_query_enhancement and extract_aspects_fn:
+            aspects = await extract_aspects_fn(query)
+            if aspects and len(aspects) > 1:
+                print(f"[DECOMPOSITION] {len(aspects)} аспектов — параллельный поиск")
+                aspect_results_list = await asyncio.gather(*[
+                    app_state.vector_store.search(aq, top_k=top_k)
+                    for aq in aspects.values()
+                ])
+                rrf_scores: dict = {}
+                rrf_docs: dict = {}
+                for results in aspect_results_list:
+                    for rank, doc in enumerate(results):
+                        key = doc['text'][:100]
+                        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (60 + rank + 1)
+                        rrf_docs[key] = doc
+                fused = sorted(rrf_docs.values(),
+                               key=lambda d: rrf_scores[d['text'][:100]], reverse=True)
+                for doc in fused:
+                    doc['score'] = rrf_scores[doc['text'][:100]]
+                search_results = fused[:top_k]
+                search_time = 0.0
+                # Skip normal search loop
+                relevant_results = [r for r in search_results if r['score'] >= self.min_relevance]
+                print(f"[DECOMPOSITION] {len(relevant_results)}/{len(search_results)} выше порога")
+                context_time = 0.0
+                if relevant_results:
+                    context = self._build_context(relevant_results)
+                    user_message = f"""=== РЕЛЕВАНТНАЯ ИНФОРМАЦИЯ ИЗ БД ===
+{context}
+
+=== ВОПРОС ===
+{query}"""
+                else:
+                    referral_results = [r for r in search_results
+                                        if r['score'] >= self.min_relevance * 0.5]
+                    if referral_results:
+                        context = self._build_context(referral_results[:3])
+                        user_message = prompts_config.build_referral_prompt(context, query)
+                    else:
+                        user_message = query
+
+                app_state.add_role_message(user_id, user_message, role="user")
+                history = app_state.get_user_messages(user_id)
+                llm_start = time.perf_counter()
+                answer = await app_state.llm_client.chat_query(history)
+                llm_time = time.perf_counter() - llm_start
+                app_state.add_role_message(user_id, answer, role="assistant")
+                sources = [{"text": r["text"][:200] + "...", "score": r["score"],
+                            "metadata": r["metadata"]} for r in relevant_results]
+                return {"answer": answer, "sources": sources}
+
         search_start = time.perf_counter()
         all_results = []
         seen_texts = set()
@@ -322,7 +378,14 @@ class RAGService:
             print(context[:500] + "..." if len(context) > 500 else context)
             print(f"{'-'*80}\n")
         else:
-            user_message = query
+            referral_results = [r for r in search_results
+                                if r['score'] >= self.min_relevance * 0.5]
+            if referral_results:
+                context = self._build_context(referral_results[:3])
+                user_message = prompts_config.build_referral_prompt(context, query)
+                print(f"[RAG CHAT] Referral fallback: {len(referral_results)} partial results")
+            else:
+                user_message = query
 
         app_state.add_role_message(user_id, user_message, role="user")
         history = app_state.get_user_messages(user_id)

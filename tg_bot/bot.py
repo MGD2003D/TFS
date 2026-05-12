@@ -10,7 +10,7 @@ from contextlib import suppress
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 from aiogram.enums import ParseMode, ChatAction
 from dotenv import load_dotenv
@@ -103,10 +103,6 @@ async def cmd_tours(message: types.Message):
     formatted_answer = format_telegram_message(result["answer"])
     await message.answer(formatted_answer, parse_mode=ParseMode.HTML)
 
-@dp.message(F.document)
-async def upload_pdf(message: types.Message):
-    pass
-
 @dp.message()
 async def any_message(message: types.Message):
     if not app_state.services_ready or not rag_service:
@@ -117,7 +113,7 @@ async def any_message(message: types.Message):
 
     typing_task = asyncio.create_task(_typing_indicator(message.chat.id))
     try:
-        result = await rag_service.chat_query(tg_id, message.text)
+        result = await rag_service.chat_query(str(tg_id), message.text)
     finally:
         typing_task.cancel()
         with suppress(asyncio.CancelledError):
