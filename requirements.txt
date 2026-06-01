@@ -23,3 +23,6 @@ aiogram<4.0
 ragas
 datasets
 psutil
+
+igraph>=0.11
+leidenalg>=0.10

@@ -466,14 +466,21 @@ class QdrantVectorStore(BaseVectorStore):
         )
 
         documents = {}
+        chunk_counts = {}
         for point in scroll_result[0]:
             doc_id = point.payload.get("document_id")
-            if doc_id and doc_id not in documents:
+            if not doc_id:
+                continue
+            chunk_counts[doc_id] = chunk_counts.get(doc_id, 0) + 1
+            if doc_id not in documents:
                 documents[doc_id] = {
                     "document_id": doc_id,
                     "source": point.payload.get("source", "unknown"),
                     "total_chunks": point.payload.get("total_chunks", 0)
                 }
+
+        for doc_id, doc in documents.items():
+            doc["indexed_chunks"] = chunk_counts.get(doc_id, 0)
 
         return list(documents.values())
 

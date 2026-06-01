@@ -73,7 +73,7 @@ async def cmd_start(message: types.Message):
         await message.answer("Сервисы еще загружаются, пожалуйста подождите...")
         return
 
-    tg_id = message.from_user.id
+    tg_id = str(message.from_user.id)
     chat_service.clear_chat_history(tg_id)
     await message.answer("Привет! Я ИИ агент TFS!\n\nКоманды:\n/tours - показать все доступные туры\n/start - начать сначала")
 

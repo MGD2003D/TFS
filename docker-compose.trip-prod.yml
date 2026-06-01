@@ -1,0 +1,85 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - trip-network
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./minio_storage:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    networks:
+      - trip-network
+
+  api:
+    image: mgd2003d/infra_zho-nevskogo-bot-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM
+      - CAILA_TOKEN=${CAILA_TOKEN}
+      - CAILA_MODEL=${CAILA_MODEL:-gemini-2.5-flash}
+
+      # Bot
+      - BOT_PLATFORM=tg
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USE_CONVERSATION_HISTORY=${USE_CONVERSATION_HISTORY:-false}
+
+      # Search
+      - ENABLE_HYBRID_SEARCH=${ENABLE_HYBRID_SEARCH:-true}
+      - ENABLE_QUERY_ENHANCEMENT=${ENABLE_QUERY_ENHANCEMENT:-true}
+      - ENABLE_DECOMPOSITION=${ENABLE_DECOMPOSITION:-false}
+
+      # Tours
+      - GENERATE_TOUR_DESCRIPTIONS=${GENERATE_TOUR_DESCRIPTIONS:-false}
+
+      # Qdrant
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+
+      # MinIO
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-admin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-documents}
+      - MINIO_SECURE=false
+
+      # HuggingFace cache
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/app/.cache/huggingface
+      - SENTENCE_TRANSFORMERS_HOME=/app/.cache/huggingface/sentence_transformers
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface/transformers
+    env_file:
+      - .env
+    depends_on:
+      - qdrant
+      - minio
+    restart: unless-stopped
+    networks:
+      - trip-network
+    volumes:
+      - ./qdrant_storage:/app/qdrant_storage
+      - ./minio_storage:/app/minio_storage
+      - ./huggingface_cache:/app/.cache/huggingface
+
+networks:
+  trip-network:
+    driver: bridge
+
+volumes:
+  qdrant_data:
+    driver: local
