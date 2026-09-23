@@ -81,7 +81,7 @@ async def cmd_start(message: types.Message):
     chat_service.clear_chat_history(tg_id)
 
     await message.answer(
-        "👋 Привет! Я ИИ-ассистент!\n\n"
+        "👋 Здравствуйте!\n\n"
         "📚 Команды:\n"
         "/search_mode - режим поиска (personal/corporate/personal_corporate)\n"
         "/upload_mode - режим загрузки документов (personal/corporate)\n"

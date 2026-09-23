@@ -15,7 +15,7 @@ from maxapi.enums.parse_mode import ParseMode
 _MD = ParseMode.MARKDOWN
 
 from services.rag_service import RAGService
-from max_bot.formatters import format_max_message
+from max_bot.formatters import format_max_message, format_sources
 import app_state
 
 load_dotenv()
@@ -32,8 +32,9 @@ dp = Dispatcher()
 rag_service = None
 
 _START_TEXT = (
-    "👋 Привет! Я ИИ-ассистент администрации Невского района Санкт-Петербурга.\n\n"
-    "Задавайте вопросы — я отвечу на основе документов администрации."
+    "👋 Здравствуйте!\n\n"
+    "Задавайте вопросы — отвечу на основе документов из базы знаний "
+    "и укажу, из каких документов взят ответ."
 )
 
 
@@ -104,5 +105,5 @@ async def any_message(event: MessageCreated):
     user_id = _user_id(event)
 
     result = await rag_service.chat_query(user_id, text, scope="corporate")
-    formatted = format_max_message(result["answer"])
+    formatted = format_max_message(result["answer"]) + format_sources(result.get("sources", []))
     await bot.send_message(chat_id=chat_id, text=formatted, parse_mode=_MD)

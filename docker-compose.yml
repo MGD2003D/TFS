@@ -46,7 +46,10 @@ services:
       - BOT_PLATFORM=${BOT_PLATFORM:-tg}
       - BOT_TOKEN=${BOT_TOKEN:-}
       - MAX_BOT_TOKEN=${MAX_BOT_TOKEN:-}
-      - CAILA_TOKEN=${CAILA_TOKEN}
+      - LLM_API_URL=${LLM_API_URL}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-false}
       - HF_TOKEN=${HF_TOKEN:-}
       - USE_CONVERSATION_HISTORY=${USE_CONVERSATION_HISTORY:-false}
       - HF_HOME=/app/.cache/huggingface

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from api.routes import api_router
 from contextlib import asynccontextmanager
+from services.llm.factory import create_llm_client
 from services.vectorstore.qdrant_client import QdrantVectorStore
 from services.document_indexer import DocumentIndexer
 from services.minio_storage import MinioStorageService
@@ -22,14 +23,7 @@ async def lifespan(app: FastAPI):
     print("\n=== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ===")
 
     print("1/8 Инициализация LLM клиента...")
-    llm_backend = os.getenv("LLM_BACKEND", "gemini").lower()
-    if llm_backend == "qwen":
-        from services.llm.caila_client import CailaClient
-        llm_client = CailaClient()
-    else:
-        from services.llm.gemini_client import GeminiClient
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        llm_client = GeminiClient(model=gemini_model)
+    llm_client = create_llm_client()
     app_state.llm_client = llm_client
     await llm_client.initialize()
     print("LLM клиент готов")
