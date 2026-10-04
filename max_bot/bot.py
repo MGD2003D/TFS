@@ -9,6 +9,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from maxapi import Bot, Dispatcher
+from maxapi.client import DefaultConnectionProperties
 from maxapi.types import MessageCreated, BotStarted, Command
 from maxapi.enums.parse_mode import ParseMode
 
@@ -26,7 +27,14 @@ MAX_BOT_TOKEN = os.getenv('MAX_BOT_TOKEN')
 if not MAX_BOT_TOKEN:
     raise RuntimeError("MAX_BOT_TOKEN не задан в переменных окружения")
 
-bot = Bot(MAX_BOT_TOKEN)
+# HTTP-прокси только для запросов к MAX API (platform-api2.max.ru),
+# внутренний трафик (LLM, Qdrant, MinIO) идёт напрямую
+MAX_PROXY = os.getenv('MAX_PROXY')
+if MAX_PROXY:
+    logging.info(f"MAX бот: используется прокси {MAX_PROXY}")
+    bot = Bot(MAX_BOT_TOKEN, default_connection=DefaultConnectionProperties(proxy=MAX_PROXY))
+else:
+    bot = Bot(MAX_BOT_TOKEN)
 dp = Dispatcher()
 
 rag_service = None

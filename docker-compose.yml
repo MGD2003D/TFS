@@ -46,6 +46,7 @@ services:
       - BOT_PLATFORM=${BOT_PLATFORM:-tg}
       - BOT_TOKEN=${BOT_TOKEN:-}
       - MAX_BOT_TOKEN=${MAX_BOT_TOKEN:-}
+      - MAX_PROXY=${MAX_PROXY:-}
       - LLM_API_URL=${LLM_API_URL}
       - LLM_MODEL=${LLM_MODEL}
       - LLM_API_KEY=${LLM_API_KEY:-}
